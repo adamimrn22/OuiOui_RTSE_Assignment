@@ -135,10 +135,40 @@ def setup_control_server():
 # Task Implementations (This is where you write your tasks)
 # ---------------------------------------------------------
 
+# Tunable AI constants
+LATERAL_SPEED_PX_S     = 400.0  # max car lateral movement speed in pixels/second
+FORWARD_SPEED_DEFAULT  = 300.0  # initial forward speed estimate in pixels/second
+FORWARD_SPEED_CAP      = 500.0  # optical flow estimate is capped here to keep reachability sane
+LOOKAHEAD_SECS         = 1.2    # seconds of travel defining the actionable sensing window
+MIN_LOOKAHEAD_PX       = 200    # floor: always look at least this far ahead (pixels)
+MAX_LOOKAHEAD_HARD_CAP = 500    # ceiling: never look further than this (pixels)
+LANE_COUNT             = 5      # number of equal-width lanes across the road
+BEHIND_MARGIN_PX       = 40     # px behind car_y still treated as a live threat
+COLLISION_RADIUS_PX    = 100    # horizontal px corridor: tokens within this of car_x = direct hit
+EVADE_SAFETY_RATIO     = 1.3    # escape side must have danger this many × farther than front threat
+STEER_HOLD_FRAMES      = 10     # sustain a steering decision for this many cycles (~50ms at 200Hz)
+
+# State persisted between processing_task() calls
+_proc_state = {
+    'prev_gray':        None,
+    'prev_time':        None,
+    'fwd_speed_px_s':   FORWARD_SPEED_DEFAULT,
+    'held_steering':    0.0,   # last committed non-zero steering decision
+    'hold_frames_left': 0,     # frames remaining to sustain held_steering
+}
+
+def time_to_intercept(dist_y, forward_speed_px_s):
+    if forward_speed_px_s <= 0:
+        return float('inf')
+    return dist_y / forward_speed_px_s
+
+def is_reachable(dist_x, dist_y, forward_speed_px_s, lateral_speed_px_s):
+    t = time_to_intercept(dist_y, forward_speed_px_s)
+    if t == float('inf'):
+        return False
+    return abs(dist_x) / lateral_speed_px_s <= t
+
 def read_single_camera(sock, data_key):
-    # Reads the latest frame from the camera socket and stores it in shared_data.
-    # Display is intentionally NOT done here — cv2.imshow must be called from the
-    # main thread on Linux (Qt backend requirement). The main loop handles display.
     if sock is None:
         return
 
@@ -197,11 +227,6 @@ def read_back_camera_task():
     read_single_camera(back_camera_sock, 'latest_back_frame')
 
 def processing_task():
-    # -----------------------------------------------------------------
-    # Step 1: Object Detection
-    # Car is fixed at bottom-center (perspective view).
-    # Detect GREEN coins (collect) and non-green colored coins (avoid).
-    # -----------------------------------------------------------------
     with data_lock:
         front_frame = shared_data['latest_front_frame']
 
@@ -210,21 +235,65 @@ def processing_task():
 
     frame = front_frame.copy()
     h, w = frame.shape[:2]
-    roi_top = int(h * 0.25)  # ignore top 25% — score/UI overlay
+    roi_top = int(h * 0.25)
 
     car_x = w // 2
     car_y = int(h * 0.85)
 
+    # --- Forward speed via Lucas-Kanade optical flow ---
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    now  = time.time()
+    fwd_speed = _proc_state['fwd_speed_px_s']
+
+    if _proc_state['prev_gray'] is not None and _proc_state['prev_time'] is not None:
+        dt = now - _proc_state['prev_time']
+        if 0 < dt < 0.5:
+            road_y1, road_y2 = int(h * 0.65), int(h * 0.85)
+            road_x1, road_x2 = int(w * 0.30), int(w * 0.70)
+            road_region = _proc_state['prev_gray'][road_y1:road_y2, road_x1:road_x2]
+
+            corners = cv2.goodFeaturesToTrack(
+                road_region, maxCorners=30, qualityLevel=0.2, minDistance=7,
+            )
+            if corners is not None and len(corners) >= 3:
+                corners_full = corners + np.array([[[road_x1, road_y1]]], dtype=np.float32)
+                next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    _proc_state['prev_gray'], gray, corners_full, None,
+                    winSize=(15, 15), maxLevel=2,
+                    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+                )
+                if next_pts is not None and status is not None:
+                    good_dy = [
+                        next_pts[i][0][1] - corners_full[i][0][1]
+                        for i, st in enumerate(status) if st[0] == 1
+                    ]
+                    if good_dy:
+                        median_dy = float(np.median(good_dy))
+                        if median_dy > 0:
+                            raw_speed = median_dy / dt
+                            fwd_speed = 0.3 * raw_speed + 0.7 * fwd_speed
+                            fwd_speed = min(fwd_speed, FORWARD_SPEED_CAP)
+
+    _proc_state['prev_gray']      = gray
+    _proc_state['prev_time']      = now
+    _proc_state['fwd_speed_px_s'] = fwd_speed
+
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # Green coin mask (collect these)
-    green_mask = cv2.inRange(hsv, np.array([40, 80, 100]), np.array([80, 255, 255]))
+    # Green: strict H=52-85 so no yellow-green coin gets mistaken for collectible
+    green_mask = cv2.inRange(hsv, np.array([52, 100, 100]), np.array([85, 255, 255]))
     green_mask[:roi_top, :] = 0
 
-    # Obstacle mask: any highly-saturated color that is NOT green (avoid these)
-    saturated = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([180, 255, 255]))
-    obstacle_mask = cv2.bitwise_and(saturated, cv2.bitwise_not(green_mask))
-    obstacle_mask[:roi_top, :] = 0
+    # Red: hue wraps at 0/180
+    red_lo   = cv2.inRange(hsv, np.array([0,   100, 100]), np.array([15,  255, 255]))
+    red_hi   = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
+    red_mask = cv2.bitwise_or(red_lo, red_hi)
+    red_mask[:roi_top, :] = 0
+
+    # Yellow/orange: H=15-52 catches amber through yellow-green so anything
+    # that is NOT strict green is treated as danger
+    yellow_mask = cv2.inRange(hsv, np.array([15, 100, 100]), np.array([52, 255, 255]))
+    yellow_mask[:roi_top, :] = 0
 
     def get_contours(mask, min_area=80):
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -232,14 +301,14 @@ def processing_task():
         for c in cnts:
             if cv2.contourArea(c) < min_area:
                 continue
-            # Reject highly elongated shapes (road borders/lane markings, not coins)
             x, y, bw, bh = cv2.boundingRect(c)
             if bw > 0 and bh > 0 and max(bw, bh) / min(bw, bh) < 4.0:
                 result.append(c)
         return result
 
-    green_coins = get_contours(green_mask, min_area=80)
-    obstacles   = get_contours(obstacle_mask, min_area=150)
+    green_coins   = get_contours(green_mask,  min_area=80)
+    red_tokens    = get_contours(red_mask,    min_area=100)
+    yellow_tokens = get_contours(yellow_mask, min_area=100)
 
     def centroid(c):
         M = cv2.moments(c)
@@ -254,84 +323,212 @@ def processing_task():
         pt = centroid(c)
         return dist_car(*pt) if pt else float('inf')
 
-    steering = 0.0
-    avoiding = False
+    steering   = 0.0
+    action     = 'HOLD'
+    all_danger = red_tokens + yellow_tokens
+
+    lookahead = int(np.clip(fwd_speed * LOOKAHEAD_SECS,
+                            MIN_LOOKAHEAD_PX, MAX_LOOKAHEAD_HARD_CAP))
 
     # -----------------------------------------------------------------
-    # Step 2 & 3: Obstacle avoidance — HIGHEST PRIORITY
-    # Danger zone scales with sqrt(area): bigger object = closer/faster
-    # approach = larger avoidance zone (speed-aware proxy).
+    # Detection
     #
-    # User rule:
-    #   obstacle in FRONT or on LEFT  (dx <= 80)  -> steer RIGHT (+1.0)
-    #   obstacle on RIGHT side only   (dx >  80)  -> steer LEFT  (-1.0)
-    # -----------------------------------------------------------------
-    for obs in sorted(obstacles, key=safe_dist):
-        obs_pt = centroid(obs)
-        if obs_pt is None:
-            continue
-        ox, oy = obs_pt
-        obs_dist = dist_car(ox, oy)
-        danger_radius = max(150, float(np.sqrt(cv2.contourArea(obs))) * 4)
-
-        if obs_dist < danger_radius:
-            dx_obs = ox - car_x
-            steering = 1.0 if dx_obs <= 80 else -1.0   # front/left -> right, right-only -> left
-            avoiding = True
-
-            bx, by, bw, bh = cv2.boundingRect(obs)
-            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0, 0, 255), 3)
-            cv2.line(frame, (car_x, car_y), (ox, oy), (0, 0, 255), 2)
-            cv2.putText(frame, f"AVOID {'RIGHT' if steering > 0 else 'LEFT'}  d={int(obs_dist)}px",
-                        (10, h - 65), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-            break   # handle nearest threat only
-
-    # -----------------------------------------------------------------
-    # Step 2 & 3: Green coin targeting (only when no avoidance active)
+    # DIRECT THREAT: token within COLLISION_RADIUS_PX of car_x horizontally.
+    #   = car will hit it if going straight.  Triggers avoidance.
     #
-    # Steering angle = sin(angle to coin) * 2.5
-    #   sin = dx / line_length  (naturally distance-aware)
-    #   * 2.5 -> full lock at ~24 degrees off-centre
-    # Far coin slightly off-centre -> gentle steer
-    # Close coin to the side      -> hard steer
+    # LEFT / RIGHT side: token is outside the corridor on that side.
+    #   = used to decide if the escape route is clear.
+    #
+    # Using |ox - car_x| instead of zone_of() means the centre trigger
+    # is a narrow corridor (200px wide for COLLISION_RADIUS_PX=100),
+    # not the full centre third of the screen.  Tokens that are offset
+    # but will naturally pass the car on the side are ignored.
     # -----------------------------------------------------------------
-    if not avoiding and green_coins:
-        target = min(green_coins, key=safe_dist)
-        pt = centroid(target)
+    direct_d = float('inf')
+    left_d   = float('inf')
+    right_d  = float('inf')
 
-        if pt:
-            gx, gy = pt
-            dx = gx - car_x
-            d_coin = dist_car(gx, gy)
+    for dc in all_danger:
+        pt = centroid(dc)
+        if pt is None: continue
+        ox, oy = pt
+        if car_y - oy < -BEHIND_MARGIN_PX: continue
+        d = dist_car(ox, oy)
+        if d > lookahead: continue
+        if abs(ox - car_x) < COLLISION_RADIUS_PX:
+            direct_d = min(direct_d, d)
+        elif ox < car_x:
+            left_d = min(left_d, d)
+        else:
+            right_d = min(right_d, d)
 
-            if d_coin > 0:
-                steering = float(np.clip((dx / d_coin) * 2.5, -1.0, 1.0))
+    ctr_greens   = []
+    left_greens  = []
+    right_greens = []
 
-            direction = ("RIGHT" if steering > 0.05
-                         else "LEFT" if steering < -0.05
-                         else "CENTER")
+    for gc in green_coins:
+        pt = centroid(gc)
+        if pt is None: continue
+        gx, gy = pt
+        if car_y - gy < -BEHIND_MARGIN_PX: continue
+        if dist_car(gx, gy) > lookahead: continue
+        if abs(gx - car_x) < COLLISION_RADIUS_PX:
+            ctr_greens.append(gc)
+        elif gx < car_x:
+            left_greens.append(gc)
+        else:
+            right_greens.append(gc)
 
-            bx, by, bw, bh = cv2.boundingRect(target)
-            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
-            cv2.circle(frame, (gx, gy), 5, (0, 255, 0), -1)
-            cv2.line(frame, (car_x, car_y), (gx, gy), (0, 255, 255), 2)
-            cv2.circle(frame, (car_x, car_y), 8, (0, 0, 255), -1)
+    has_threat   = direct_d < float('inf')
+    # Escape side usable when its danger is far enough vs the front threat
+    right_usable = (not has_threat) or (right_d > direct_d * EVADE_SAFETY_RATIO)
+    left_usable  = (not has_threat) or (left_d  > direct_d * EVADE_SAFETY_RATIO)
 
-            if abs(steering) > 0.05:
-                cv2.arrowedLine(frame, (car_x, car_y),
-                                (car_x + int(steering * (w // 2)), car_y),
-                                (0, 0, 255), 3, tipLength=0.3)
+    def steer_to(c):
+        pt = centroid(c)
+        if not pt: return 0.0
+        gx, gy = pt
+        d = dist_car(gx, gy)
+        return float(np.clip(((gx - car_x) / d) * 2.5, -1.0, 1.0)) if d > 0 else 0.0
 
-            cv2.putText(frame, f"GREEN {direction} [{steering:+.2f}]  dist={int(d_coin)}px",
-                        (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    # -----------------------------------------------------------------
+    # Decision cascade
+    #
+    # 1. Direct threat → AVOID (full ±1.0 steering)
+    #    a. Both sides usable → prefer side with green, else right
+    #    b. Only right usable → RIGHT
+    #    c. Only left usable  → LEFT
+    #    d. Both blocked      → side with green, else less dangerous side
+    #
+    # 2. No threat → collect green
+    #    a. Green in corridor (straight ahead) → steer toward it
+    #    b. Green right (right usable)         → steer right
+    #    c. Green left  (left usable)          → steer left
+    #    d. Nothing                            → HOLD
+    # -----------------------------------------------------------------
+    if has_threat:
+        if right_usable and left_usable:
+            rgt_sc = right_d + (300 if right_greens else 0)
+            lft_sc = left_d  + (300 if left_greens  else 0)
+            steering = 1.0 if rgt_sc >= lft_sc else -1.0
+            action   = f'AVOID {"RIGHT" if steering > 0 else "LEFT"}  d={int(direct_d)}px'
+        elif right_usable:
+            steering = 1.0
+            action   = f'AVOID RIGHT  d={int(direct_d)}px  r={int(right_d)}px'
+        elif left_usable:
+            steering = -1.0
+            action   = f'AVOID LEFT  d={int(direct_d)}px  l={int(left_d)}px'
+        else:
+            rgt_sc = right_d + (500 if right_greens else 0)
+            lft_sc = left_d  + (500 if left_greens  else 0)
+            steering = 1.0 if rgt_sc >= lft_sc else -1.0
+            action   = f'AVOID FORCE {"R" if steering > 0 else "L"} BLOCKED d={int(direct_d)}px'
 
-    elif not avoiding:
-        cv2.putText(frame, "Scanning for GREEN...",
-                    (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+    elif ctr_greens:
+        target   = min(ctr_greens, key=safe_dist)
+        steering = steer_to(target)
+        pt       = centroid(target)
+        action   = f'GREEN AHEAD  d={int(dist_car(*pt)) if pt else 0}px'
+
+    elif right_greens and right_usable:
+        target   = min(right_greens, key=safe_dist)
+        steering = max(steer_to(target), 0.45)   # minimum magnitude so car commits to the lane change
+        pt       = centroid(target)
+        action   = f'GREEN RIGHT  d={int(dist_car(*pt)) if pt else 0}px'
+
+    elif left_greens and left_usable:
+        target   = min(left_greens, key=safe_dist)
+        steering = min(steer_to(target), -0.45)  # minimum magnitude leftward
+        pt       = centroid(target)
+        action   = f'GREEN LEFT  d={int(dist_car(*pt)) if pt else 0}px'
+
+    # Steering inertia: once a direction is committed, lock it for STEER_HOLD_FRAMES
+    # cycles.  A new signal in the SAME direction refreshes the counter; a signal in
+    # the OPPOSITE direction is ignored unless it comes from direct-collision avoidance
+    # (|steering| == 1.0 and has_threat) — that's an emergency override.
+    if steering != 0.0:
+        same_dir = (np.sign(steering) == np.sign(_proc_state['held_steering']))
+        emergency = (abs(steering) >= 1.0 and has_threat)
+        if same_dir or emergency or _proc_state['hold_frames_left'] == 0:
+            _proc_state['held_steering']    = steering
+            _proc_state['hold_frames_left'] = STEER_HOLD_FRAMES
+        else:
+            # mid-hold direction flip from non-emergency: keep current direction
+            steering = _proc_state['held_steering']
+            _proc_state['hold_frames_left'] -= 1
+    elif _proc_state['hold_frames_left'] > 0:
+        steering = _proc_state['held_steering']
+        _proc_state['hold_frames_left'] -= 1
+
+    steering = float(np.clip(steering, -1.0, 1.0))
+
+    # -----------------------------------------------------------------
+    # Visualization
+    # -----------------------------------------------------------------
+    corr_l = car_x - COLLISION_RADIUS_PX
+    corr_r = car_x + COLLISION_RADIUS_PX
+    cv2.line(frame, (corr_l, roi_top), (corr_l, car_y), (0, 100, 200), 1)
+    cv2.line(frame, (corr_r, roi_top), (corr_r, car_y), (0, 100, 200), 1)
+    horizon_y = max(roi_top, car_y - lookahead)
+    cv2.line(frame, (0, horizon_y), (w, horizon_y), (60, 60, 60), 1)
+
+    for lbl, dx, dd, gr in [
+        ('L', corr_l // 2,        left_d,   left_greens),
+        ('C', car_x,              direct_d, ctr_greens),
+        ('R', (corr_r + w) // 2, right_d,  right_greens),
+    ]:
+        has_d = dd < float('inf')
+        dot_col = (0, 0, 200) if has_d else (0, 200, 0) if gr else (80, 80, 80)
+        cv2.circle(frame, (dx, roi_top + 12), 8, dot_col, -1)
+        if has_d:
+            cv2.putText(frame, f"{int(dd)}",
+                        (dx - 14, roi_top + 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (80, 160, 255), 1)
+
+    for gc in ctr_greens + left_greens + right_greens:
+        bx, by, bw2, bh = cv2.boundingRect(gc)
+        cv2.rectangle(frame, (bx, by), (bx + bw2, by + bh), (0, 255, 0), 2)
+
+    for dc in red_tokens:
+        pt = centroid(dc)
+        if pt and car_y - pt[1] >= -BEHIND_MARGIN_PX and dist_car(*pt) <= lookahead:
+            bx, by, bw2, bh = cv2.boundingRect(dc)
+            cv2.rectangle(frame, (bx, by), (bx + bw2, by + bh), (0, 0, 255), 2)
+    for dc in yellow_tokens:
+        pt = centroid(dc)
+        if pt and car_y - pt[1] >= -BEHIND_MARGIN_PX and dist_car(*pt) <= lookahead:
+            bx, by, bw2, bh = cv2.boundingRect(dc)
+            cv2.rectangle(frame, (bx, by), (bx + bw2, by + bh), (0, 200, 255), 2)
+
+    cv2.circle(frame, (car_x, car_y), 8, (0, 0, 255), -1)
+    if abs(steering) > 0.05:
+        cv2.arrowedLine(frame, (car_x, car_y),
+                        (car_x + int(steering * (w // 4)), car_y),
+                        (255, 255, 0), 3, tipLength=0.3)
+
+    if   steering < -0.6: steer_label = "HARD LEFT"
+    elif steering < -0.2: steer_label = "Left"
+    elif steering >  0.6: steer_label = "HARD RIGHT"
+    elif steering >  0.2: steer_label = "Right"
+    else:                 steer_label = "Center"
+
+    def dfmt(d, g):
+        return f"{int(d)}px" if d < float('inf') else ('G' if g else '-')
+
+    cv2.putText(frame, f"Action: {action}",
+                (10, h - 65), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
+    cv2.putText(frame,
+                f"L:{dfmt(left_d,left_greens)}  "
+                f"C:{dfmt(direct_d,ctr_greens)}  "
+                f"R:{dfmt(right_d,right_greens)}  "
+                f"look={lookahead}px  spd={int(fwd_speed)}px/s",
+                (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1)
+    cv2.putText(frame, f"[{steer_label}] {steering:+.2f}",
+                (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
     with data_lock:
-        shared_data['steering_input'] = steering
-        shared_data['acceleration_input'] = 1.0   # always full speed forward
+        shared_data['steering_input']      = steering
+        shared_data['acceleration_input']  = 1.0
         shared_data['display_front_frame'] = frame
 
 def send_controls_task():
@@ -357,28 +554,21 @@ def send_controls_task():
 if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
 
-    # Initialize network connections
     threading.Thread(target=setup_control_server, daemon=True).start()
     threading.Thread(target=setup_cameras, daemon=True).start()
 
     print("\n--- Starting Real-Time Tasks (awaiting connections dynamically) ---\n")
 
-    # This is where you define tasks with explicit Scheduling parameters (Concurrency, Priority, Period)
-    # Period refers to the period of execution of the task in seconds
-    # Priority refers to the priority of the task, higher priority means higher priority
-    # Concurrency refers to the number of instances of the task that can run at the same time
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
 
-    # Start tasks to run concurrently
     t_front_camera.start()
     t_back_camera.start()
     t_processing.start()
     t_controls.start()
 
-    # Hold W key down for any additional in-game speed boost the game accepts via keyboard
     try:
         keyboard.press('w')
         print("W key held for speed boost.")
@@ -386,8 +576,6 @@ if __name__ == '__main__':
         pass
 
     try:
-        # All cv2.imshow calls must happen on the main thread (Qt/Linux requirement).
-        # ~30 fps display loop — does not affect the 200 Hz control tasks above.
         while is_running:
             time.sleep(0.033)
             with data_lock:
@@ -408,13 +596,11 @@ if __name__ == '__main__':
         except Exception:
             pass
 
-    # This is to make sure that the tasks are terminated cleanly
     t_front_camera.join()
     t_back_camera.join()
     t_processing.join()
     t_controls.join()
 
-    # This is to close all the connections
     if front_camera_sock:
         front_camera_sock.close()
     if back_camera_sock:
