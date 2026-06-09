@@ -194,9 +194,9 @@ def read_single_camera(sock, window_name, data_key):
                     shared_data[data_key] = frame
                 
                 # You may disable this if you don't need to display the frames / This could effect the fps
-                frame_resized = cv2.resize(frame, (640, 480))
-                cv2.imshow(window_name, frame_resized)
-                cv2.waitKey(1)
+                #frame_resized = cv2.resize(frame, (640, 480))
+                #cv2.imshow(window_name, frame_resized)
+                #cv2.waitKey(1)
                 
     except Exception as e:
         pass
@@ -262,7 +262,103 @@ def processing_task():
                 token_x = x + cw // 2
                 break
 
-    # Decision logic to be added in next commit
+    # --- Decision logic ---
+    mid_x = w // 2
+    steer = 0.0
+    accel = 1.0
+    now = time.time()
+
+    with data_lock:
+        dodge_direction = shared_data['dodge_direction']
+        dodge_until     = shared_data['dodge_until']
+        lane_offset     = shared_data['lane_offset']
+
+    # ------------------------------------------------------------------
+    # GREEN token  →  steer aggressively TOWARD it to collect
+    # ------------------------------------------------------------------
+    if detected == 'green':
+        offset = token_x - mid_x
+        if abs(offset) > 40:
+            # Scale steering proportionally: further away = harder steer
+            steer = max(-1.0, min(1.0, offset / (mid_x * 0.6)))
+        else:
+            steer = 0.0   # already aligned, go straight for collection
+        # Update running lane offset so dodge logic stays aware
+        lane_offset = max(-1.0, min(1.0, lane_offset + steer * 0.1))
+        with data_lock:
+            shared_data['dodge_direction']    = 0.0
+            shared_data['dodge_until']        = 0.0
+            shared_data['lane_offset']        = lane_offset
+            shared_data['steering_input']     = steer
+            shared_data['acceleration_input'] = accel
+
+    # ------------------------------------------------------------------
+    # RED / YELLOW token  →  dodge AWAY from it, cross lanes if needed
+    # ------------------------------------------------------------------
+    elif detected in ('red', 'yellow'):
+        # If we're already in an active dodge, keep holding it
+        if now < dodge_until and dodge_direction != 0.0:
+            steer = dodge_direction
+        else:
+            # Choose dodge direction opposite to token side
+            if token_x < mid_x:
+                preferred = 1.0   # token on left  → dodge right
+            else:
+                preferred = -1.0  # token on right → dodge left
+
+            # If already at the edge in that direction, flip to only available side
+            if lane_offset >= 0.9 and preferred > 0:
+                preferred = -1.0
+            elif lane_offset <= -0.9 and preferred < 0:
+                preferred = 1.0
+
+            steer = preferred
+
+            # Hold longer for closer/larger tokens
+            if token_area > 2000:
+                hold = 0.35    # large/close → long hard swerve
+            elif token_area > 800:
+                hold = 0.20    # medium distance
+            else:
+                hold = 0.12    # small/far  → short nudge
+
+            dodge_direction = steer
+            dodge_until     = now + hold
+            lane_offset     = max(-1.0, min(1.0, lane_offset + steer * 0.5))
+
+            with data_lock:
+                shared_data['dodge_direction'] = dodge_direction
+                shared_data['dodge_until']     = dodge_until
+                shared_data['lane_offset']     = lane_offset
+
+        with data_lock:
+            shared_data['steering_input']     = steer
+            shared_data['acceleration_input'] = accel
+
+    # ------------------------------------------------------------------
+    # No token detected  →  hold any active dodge, then re-centre gently
+    # ------------------------------------------------------------------
+    else:
+        if now < dodge_until and dodge_direction != 0.0:
+            steer = dodge_direction
+        else:
+            # Gently steer back toward centre lane
+            if lane_offset > 0.15:
+                steer = -0.4
+            elif lane_offset < -0.15:
+                steer = 0.4
+            else:
+                steer = 0.0
+                lane_offset = 0.0   # snap to centre
+
+            lane_offset = max(-1.0, min(1.0, lane_offset + steer * 0.05))
+            with data_lock:
+                shared_data['lane_offset'] = lane_offset
+
+        with data_lock:
+            shared_data['steering_input']     = steer
+            shared_data['acceleration_input'] = accel
+
     with data_lock:
         shared_data['last_token'] = detected
 
@@ -310,7 +406,7 @@ if __name__ == '__main__':
     # Concurrency refers to the number of instances of the task that can run at the same time
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
-    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.HIGH, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
     
     # Start tasks to run concurrently
