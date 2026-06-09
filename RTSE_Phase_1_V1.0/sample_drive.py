@@ -232,8 +232,40 @@ def processing_task():
     # Pre-compute second red range (hue wraps around at 180)
     red_mask_high = cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
 
-    # write your processing here (token detection to be added next)
-    pass
+    # --- Token color ranges in HSV ---
+    token_colors = {
+        'green':  (np.array([40, 80, 80]),   np.array([80, 255, 255])),
+        'red':    (np.array([0, 120, 70]),    np.array([10, 255, 255])),
+        'yellow': (np.array([20, 100, 100]),  np.array([35, 255, 255])),
+    }
+
+    # Region of interest: only the middle 60% of the frame (tokens appear in front)
+    h, w = front_frame.shape[:2]
+    roi_top = int(h * 0.25)
+    roi_bot = int(h * 0.75)
+
+    detected = None
+    token_x = w // 2   # default to centre if nothing detected
+    token_area = 0
+
+    for color_name, (lower, upper) in token_colors.items():
+        mask = cv2.inRange(hsv[roi_top:roi_bot, :], lower, upper)
+        if color_name == 'red':
+            mask = cv2.bitwise_or(mask, red_mask_high[roi_top:roi_bot, :])
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > 300:
+                x, y, cw, ch = cv2.boundingRect(largest)
+                token_area = cv2.contourArea(largest)
+                detected = color_name
+                token_x = x + cw // 2
+                break
+
+    # Decision logic to be added in next commit
+    with data_lock:
+        shared_data['last_token'] = detected
+
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
