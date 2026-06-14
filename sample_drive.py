@@ -31,6 +31,12 @@ URGENCY_HIGH_AREA     = 1000  # medium distance token
 # Challenge 1 — Low Light
 LOW_BRIGHTNESS_THRESHOLD = 60  # mean pixel value below this = light is off
 
+# Challenge 3 — Police Car
+POLICE_DEADLINE          = 10.0  # seconds to collect a red token before 50% speed penalty
+POLICE_URGENT_THRESHOLD  = 3.0   # seconds remaining when we enter full-commit mode
+POLICE_MIN_AREA          = 2000  # min contour area to qualify as a police car (not a token)
+POLICE_ABSENT_GRACE      = 1.5   # seconds police car can be absent before mode deactivates
+
 # ---------------------------------------------------------
 # Shared Resources
 # ---------------------------------------------------------
@@ -63,6 +69,14 @@ shared_data = {
     'dodge_direction': 0.0,
     'dodge_until':     0.0,
     'lane_offset':     0.0,
+
+    # Challenge 3 — Police Car state
+    # Written by detection_task + police_watchdog_task, read by decision_task
+    'police_active':     False,  # True while police car challenge is running
+    'police_start_time': 0.0,    # timestamp when police was first detected
+    'police_urgent':     False,  # True when < POLICE_URGENT_THRESHOLD seconds remain
+    'police_bbox':       None,   # (x, y, w, h) of police car — used as no-go zone
+    'police_last_seen':  0.0,    # timestamp of most recent positive police detection
 }
 data_lock = threading.Lock()
 is_running = True
@@ -284,6 +298,84 @@ def brightness_task():
 
 
 # ---------------------------------------------------------
+# Challenge 3 — Police Car Helper
+#
+# Scans the HSV frame for a large blue-coloured object.
+# Blue (H 100–130) is not used by any regular token, making it a
+# clean discriminator.  Contour must exceed POLICE_MIN_AREA to
+# rule out small blue artefacts.
+# Called inside detection_task (already has the HSV frame ready).
+# ---------------------------------------------------------
+def detect_police_car(hsv, frame_h, frame_w):
+    blue_mask = cv2.inRange(
+        hsv,
+        np.array([100, 80, 80]),
+        np.array([130, 255, 255])
+    )
+    # Only search the forward portion of the frame
+    roi_top = int(frame_h * 0.10)
+    roi_bot = int(frame_h * 0.80)
+    blue_mask[:roi_top, :] = 0
+    blue_mask[roi_bot:,  :] = 0
+
+    contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < POLICE_MIN_AREA:
+        return None
+
+    x, y, bw, bh = cv2.boundingRect(largest)
+    return (x, y, bw, bh)
+
+
+# ---------------------------------------------------------
+# Challenge 3 — Police Watchdog Task (LOW priority, 100 ms period)
+#
+# Sole responsibility: track the 10-second deadline and flip the
+# police_urgent flag when time is running short.
+#
+# RTSE rationale:
+#   - Deadline tracking is decoupled from heavy detection work so it
+#     fires reliably regardless of how long detection_task takes.
+#   - LOW priority is appropriate — it only updates a flag, and
+#     100 ms resolution is more than sufficient for a 10 s deadline.
+#   - When deadline expires, resets all police state so the system
+#     cleanly returns to normal mode.
+# ---------------------------------------------------------
+def police_watchdog_task():
+    with data_lock:
+        police_active     = shared_data['police_active']
+        police_start_time = shared_data['police_start_time']
+
+    if not police_active:
+        return
+
+    elapsed   = time.time() - police_start_time
+    remaining = POLICE_DEADLINE - elapsed
+
+    if remaining <= 0:
+        # Deadline expired — game applies the 50% speed penalty
+        with data_lock:
+            shared_data['police_active']  = False
+            shared_data['police_urgent']  = False
+            shared_data['police_bbox']    = None
+            shared_data['event_active']   = None
+        print("[POLICE] Deadline expired — 50% speed penalty applied by game.")
+        return
+
+    urgent = remaining <= POLICE_URGENT_THRESHOLD
+    with data_lock:
+        shared_data['police_urgent'] = urgent
+
+    if urgent:
+        print(f"[POLICE] URGENT — {remaining:.1f}s left! Committing to RED token only!")
+    else:
+        print(f"[POLICE] Active — {remaining:.1f}s remaining to collect RED token.")
+
+
+# ---------------------------------------------------------
 # Proposal 2 — Detection Task (MEDIUM priority, 10 ms period)
 #
 # Sole responsibility: read the front frame, run all OpenCV work,
@@ -357,6 +449,37 @@ def detection_task():
     else:
         urgency = 'LOW'
 
+    # --- Challenge 3: police car detection (reuses the HSV frame already computed) ---
+    police_bbox = detect_police_car(hsv, h, w)
+    now         = time.time()
+
+    with data_lock:
+        police_active = shared_data['police_active']
+
+    if police_bbox is not None:
+        if not police_active:
+            print("[POLICE] Police car detected! 10 seconds to collect a RED token!")
+        with data_lock:
+            shared_data['police_active']     = True
+            shared_data['police_start_time'] = shared_data['police_start_time'] if police_active else now
+            shared_data['police_bbox']       = police_bbox
+            shared_data['police_last_seen']  = now
+            shared_data['event_active']      = 'police'
+    else:
+        with data_lock:
+            last_seen = shared_data['police_last_seen']
+
+        if police_active and (now - last_seen) > POLICE_ABSENT_GRACE:
+            print("[POLICE] Police car gone — returning to normal mode.")
+            with data_lock:
+                shared_data['police_active'] = False
+                shared_data['police_urgent'] = False
+                shared_data['police_bbox']   = None
+                shared_data['event_active']  = None
+        else:
+            with data_lock:
+                shared_data['police_bbox'] = None  # clear bbox each frame if not visible
+
     # --- Proposal 4: single brief write-back lock ---
     with data_lock:
         # Write detection results for decision_task to consume
@@ -390,6 +513,9 @@ def decision_task():
         lane_offset      = shared_data['lane_offset']
         frame_w          = shared_data['frame_w']
         frame_h          = shared_data['frame_h']
+        police_active    = shared_data['police_active']
+        police_urgent    = shared_data['police_urgent']
+        police_bbox      = shared_data['police_bbox']
 
     # ------------------------------------------------------------------
     # Challenge 1 — Low Light Mode
@@ -406,10 +532,65 @@ def decision_task():
 
     # All decision logic runs outside the lock
     mid_x = frame_w // 2
-    car_y = int(frame_h * 0.85)   # approximate player car position in frame
+    car_y = int(frame_h * 0.85)
     steer = 0.0
     accel = 1.0
     now   = time.time()
+
+    # ------------------------------------------------------------------
+    # Challenge 3 — Police Mode
+    #
+    # Goal inversion: red tokens switch from "dodge" to "collect".
+    # Two hard constraints run simultaneously:
+    #   1. Never steer into the police car bounding box (game over risk).
+    #   2. Seek the nearest red token within the 10s deadline.
+    # When urgent (< 3s left), green tokens are ignored entirely.
+    # ------------------------------------------------------------------
+    if police_active:
+        # Work out which side the police car occupies so we can avoid it
+        police_side = 0   # -1 = left, 0 = not a direct threat, 1 = right
+        if police_bbox is not None:
+            px, py, pbw, pbh = police_bbox
+            pcx = px + pbw // 2
+            # Only a collision threat if it is laterally close and ahead
+            if abs(pcx - mid_x) < (frame_w * 0.25) and (car_y - (py + pbh)) < 200:
+                police_side = -1 if pcx >= mid_x else 1
+
+        if detected == 'red':
+            # Steer TOWARD the red token (opposite of normal behaviour)
+            offset = token_x - mid_x
+            if abs(offset) > 40:
+                steer = max(-1.0, min(1.0, offset / (mid_x * 0.6)))
+            else:
+                steer = 0.0
+            # If police car is on the same side as the token, approach cautiously
+            if police_side != 0 and np.sign(steer) == np.sign(police_side):
+                steer *= 0.5
+            lane_offset = max(-1.0, min(1.0, lane_offset + steer * 0.1))
+
+        elif detected == 'green' and not police_urgent:
+            # Green is fine when time is not critical — but avoid police car side
+            offset = token_x - mid_x
+            steer  = max(-1.0, min(1.0, offset / (mid_x * 0.6))) if abs(offset) > 40 else 0.0
+            if police_side != 0 and np.sign(steer) == np.sign(police_side):
+                steer = 0.0   # skip this green — too risky
+            lane_offset = max(-1.0, min(1.0, lane_offset + steer * 0.1))
+
+        else:
+            # No red visible (or urgent + no red) — scan or drift away from police
+            if police_side != 0:
+                steer = float(police_side) * -0.4   # drift away from police car
+            elif police_urgent:
+                steer = 0.3 if (int(now * 2) % 2 == 0) else -0.3  # gentle scan
+            else:
+                steer = -0.3 if lane_offset > 0.15 else (0.3 if lane_offset < -0.15 else 0.0)
+            lane_offset = max(-1.0, min(1.0, lane_offset + steer * 0.05))
+
+        with data_lock:
+            shared_data['lane_offset']        = lane_offset
+            shared_data['steering_input']     = steer
+            shared_data['acceleration_input'] = accel
+        return   # skip normal token logic entirely
 
     # ------------------------------------------------------------------
     # GREEN token → steer TOWARD it to collect
@@ -524,10 +705,10 @@ def send_controls_task():
         steering_input     = shared_data['steering_input']
         acceleration_input = shared_data['acceleration_input']
         low_light_active   = shared_data['low_light_active']
+        police_active      = shared_data['police_active']
 
-    # Only force full throttle when NOT in low light mode.
-    # In low light, decision_task already set acceleration_input = -1.0
-    # and we must let that pass through unmodified.
+    # Force full throttle in normal mode and police mode.
+    # In low light, decision_task sets -1.0 and we must not override it.
     if not low_light_active:
         acceleration_input = 1.0
 
@@ -557,20 +738,22 @@ if __name__ == '__main__':
 
     print("\n--- Starting Real-Time Tasks ---\n")
     print("RMS Schedule:")
-    print("  SendControls   : 2ms  | HIGH   — always sends latest control")
-    print("  ReadFrontCamera: 5ms  | HIGH   — feeds brightness + detection pipeline")
-    print("  BrightnessTask : 5ms  | HIGH   — Challenge 1: hard real-time light detection")
-    print("  DecisionTask   : 5ms  | HIGH   — fast steering logic, no cv2")
-    print("  ReadBackCamera : 10ms | MEDIUM — back camera feed")
-    print("  DetectionTask  : 10ms | MEDIUM — heavy cv2 token detection\n")
+    print("  SendControls   : 2ms   | HIGH   — always sends latest control")
+    print("  ReadFrontCamera: 5ms   | HIGH   — feeds brightness + detection pipeline")
+    print("  BrightnessTask : 5ms   | HIGH   — Challenge 1: hard real-time light detection")
+    print("  DecisionTask   : 5ms   | HIGH   — fast steering logic, no cv2")
+    print("  ReadBackCamera : 10ms  | MEDIUM — back camera feed")
+    print("  DetectionTask  : 10ms  | MEDIUM — heavy cv2 token + police car detection")
+    print("  PoliceWatchdog : 100ms | LOW    — Challenge 3: deadline countdown\n")
 
     # Proposal 1 — RMS-ordered task definitions
-    t_send_controls  = RTTask("SendControls",    period=0.002, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
-    t_front_camera   = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH,   execute_func=read_front_camera_task)
-    t_brightness     = RTTask("BrightnessTask",  period=0.005, priority=TaskPriority.HIGH,   execute_func=brightness_task)
-    t_decision       = RTTask("DecisionTask",    period=0.005, priority=TaskPriority.HIGH,   execute_func=decision_task)
-    t_back_camera    = RTTask("ReadBackCamera",  period=0.010, priority=TaskPriority.MEDIUM, execute_func=read_back_camera_task)
-    t_detection      = RTTask("DetectionTask",   period=0.010, priority=TaskPriority.MEDIUM, execute_func=detection_task)
+    t_send_controls   = RTTask("SendControls",    period=0.002, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
+    t_front_camera    = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH,   execute_func=read_front_camera_task)
+    t_brightness      = RTTask("BrightnessTask",  period=0.005, priority=TaskPriority.HIGH,   execute_func=brightness_task)
+    t_decision        = RTTask("DecisionTask",    period=0.005, priority=TaskPriority.HIGH,   execute_func=decision_task)
+    t_back_camera     = RTTask("ReadBackCamera",  period=0.010, priority=TaskPriority.MEDIUM, execute_func=read_back_camera_task)
+    t_detection       = RTTask("DetectionTask",   period=0.010, priority=TaskPriority.MEDIUM, execute_func=detection_task)
+    t_police_watchdog = RTTask("PoliceWatchdog",  period=0.100, priority=TaskPriority.LOW,    execute_func=police_watchdog_task)
 
     t_send_controls.start()
     t_front_camera.start()
@@ -578,6 +761,7 @@ if __name__ == '__main__':
     t_decision.start()
     t_back_camera.start()
     t_detection.start()
+    t_police_watchdog.start()
 
     try:
         while is_running:
@@ -592,6 +776,7 @@ if __name__ == '__main__':
     t_decision.join()
     t_back_camera.join()
     t_detection.join()
+    t_police_watchdog.join()
 
     if front_camera_sock:
         front_camera_sock.close()
