@@ -1,6 +1,5 @@
 """
 core.py — shared state, the real-time framework, networking and camera I/O.
-Owner: Adam (project scaffolding)
 
 Holds the global shared_data/data_lock, the DriveState enum, and the two
 "do not change" blocks (RTTask framework + network setup), kept verbatim.

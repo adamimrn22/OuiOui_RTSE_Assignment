@@ -1,6 +1,5 @@
 """
 config.py — shared constants for the RTSE controller.
-Owner: Adam (project scaffolding)
 
 All tunable numbers live here so every module reads the same values.
 """
