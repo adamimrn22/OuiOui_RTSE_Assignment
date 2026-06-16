@@ -22,19 +22,7 @@ shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
     'steering_input' : 0.0,
-    'acceleration_input' : 0.0,
-    # Token detection
-    'last_token': None,
-    'event_active': None,
-    'corrupted_frame': False,
-    'steering_cooldown': 0.0,
-    # Dodge / lane state
-    'dodge_direction': 0.0,
-    'dodge_until': 0.0,
-    'lane_offset': 0.0,
-    # Challenge 1 — Low Light (one-shot guard)
-    'low_light_active': False,  # True while brightness is below threshold
-    'low_light_done':   False,  # True after the event resolves — never re-triggers
+    'acceleration_input' : 0.0
 }
 data_lock = threading.Lock()
 is_running = True
@@ -147,6 +135,7 @@ def setup_control_server():
 # ---------------------------------------------------------
 
 def read_single_camera(sock, window_name, data_key):
+    #This function reads the latest frame from the camera socket and stores it in the shared data
     if sock is None:
         return
         
@@ -195,9 +184,10 @@ def read_single_camera(sock, window_name, data_key):
                 with data_lock:
                     shared_data[data_key] = frame
                 
-                #frame_resized = cv2.resize(frame, (640, 480))
-                #cv2.imshow(window_name, frame_resized)
-                #cv2.waitKey(1)
+                # You may disable this if you don't need to display the frames / This could effect the fps
+                frame_resized = cv2.resize(frame, (640, 480))
+                cv2.imshow(window_name, frame_resized)
+                cv2.waitKey(1)
                 
     except Exception as e:
         pass
@@ -209,171 +199,32 @@ def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
 def processing_task():
+    #This is where you write your image processing code to decide how to control the car
+    #You can use libraries like OpenCV to process the image
+    #There is no limtation to the complexity of the processing task, you can use any libraries you want
+    #Remember to use the shared_data to get the latest frame
     with data_lock:
-        front_frame       = shared_data['latest_front_frame']
-        low_light_active  = shared_data['low_light_active']
-        low_light_done    = shared_data['low_light_done']
+        front_frame = shared_data['latest_front_frame']
     
-    if front_frame is None:
-        return
-
-    # ------------------------------------------------------------------
-    # Challenge 1 — Low Light (one-shot, first 10 s only)
-    #
-    # low_light_done is set to True the moment brightness recovers.
-    # After that, the entire brightness block is skipped forever —
-    # any dark frame later (shadow, glitch) cannot re-trigger -1.0.
-    # ------------------------------------------------------------------
-    if not low_light_done:
-        brightness = np.mean(cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY))
-
-        if brightness < 60:
-            # Light is off — send recovery signal, hold lane, skip tokens
-            if not low_light_active:
-                print(f"[LOW LIGHT] Detected (brightness={brightness:.1f}). Sending -1.0.")
-            with data_lock:
-                shared_data['low_light_active']   = True
-                shared_data['event_active']       = 'low_brightness'
-                shared_data['steering_input']     = 0.0
-                shared_data['acceleration_input'] = -1.0
-            return   # tokens invisible — skip detection entirely
-
-        else:
-            if low_light_active:
-                # Brightness just recovered — close the event, arm the one-shot guard
-                print("[LOW LIGHT] Recovered. Resuming normal drive.")
-                with data_lock:
-                    shared_data['low_light_active'] = False
-                    shared_data['low_light_done']   = True   # never fires again
-                    shared_data['event_active']     = None
-
-    # ------------------------------------------------------------------
-    # Normal token detection (runs every cycle when light is on,
-    # and permanently after low_light_done = True)
-    # ------------------------------------------------------------------
-    hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
-    red_mask_high = cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
-
-    token_colors = {
-        'green':  (np.array([40, 80, 80]),   np.array([80, 255, 255])),
-        'red':    (np.array([0, 120, 70]),    np.array([10, 255, 255])),
-        'yellow': (np.array([20, 100, 100]),  np.array([35, 255, 255])),
-    }
-
-    h, w = front_frame.shape[:2]
-    roi_top = int(h * 0.25)
-    roi_bot = int(h * 0.75)
-
-    detected   = None
-    token_x    = w // 2
-    token_area = 0
-
-    for color_name, (lower, upper) in token_colors.items():
-        mask = cv2.inRange(hsv[roi_top:roi_bot, :], lower, upper)
-        if color_name == 'red':
-            mask = cv2.bitwise_or(mask, red_mask_high[roi_top:roi_bot, :])
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest) > 300:
-                x, y, cw, ch = cv2.boundingRect(largest)
-                token_area = cv2.contourArea(largest)
-                detected   = color_name
-                token_x    = x + cw // 2
-                break
-
-    mid_x = w // 2
-    steer = 0.0
-    accel = 1.0
-    now   = time.time()
-
-    with data_lock:
-        dodge_direction = shared_data['dodge_direction']
-        dodge_until     = shared_data['dodge_until']
-        lane_offset     = shared_data['lane_offset']
-
-    # GREEN → steer toward it
-    if detected == 'green':
-        offset = token_x - mid_x
-        steer  = max(-1.0, min(1.0, offset / (mid_x * 0.6))) if abs(offset) > 40 else 0.0
-        lane_offset = max(-1.0, min(1.0, lane_offset + steer * 0.1))
-        with data_lock:
-            shared_data['dodge_direction']    = 0.0
-            shared_data['dodge_until']        = 0.0
-            shared_data['lane_offset']        = lane_offset
-            shared_data['steering_input']     = steer
-            shared_data['acceleration_input'] = accel
-
-    # RED / YELLOW → dodge away
-    elif detected in ('red', 'yellow'):
-        if now < dodge_until and dodge_direction != 0.0:
-            steer = dodge_direction
-        else:
-            preferred = 1.0 if token_x < mid_x else -1.0
-            if lane_offset >= 0.9 and preferred > 0:
-                preferred = -1.0
-            elif lane_offset <= -0.9 and preferred < 0:
-                preferred = 1.0
-
-            steer = preferred
-            hold  = 0.35 if token_area > 2000 else 0.20 if token_area > 800 else 0.12
-
-            dodge_direction = steer
-            dodge_until     = now + hold
-            lane_offset     = max(-1.0, min(1.0, lane_offset + steer * 0.5))
-
-            with data_lock:
-                shared_data['dodge_direction'] = dodge_direction
-                shared_data['dodge_until']     = dodge_until
-                shared_data['lane_offset']     = lane_offset
-
-        with data_lock:
-            shared_data['steering_input']     = steer
-            shared_data['acceleration_input'] = accel
-
-    # Nothing → hold dodge then re-centre
-    else:
-        if now < dodge_until and dodge_direction != 0.0:
-            steer = dodge_direction
-        else:
-            if lane_offset > 0.15:
-                steer = -0.4
-            elif lane_offset < -0.15:
-                steer = 0.4
-            else:
-                steer       = 0.0
-                lane_offset = 0.0
-            lane_offset = max(-1.0, min(1.0, lane_offset + steer * 0.05))
-            with data_lock:
-                shared_data['lane_offset'] = lane_offset
-
-        with data_lock:
-            shared_data['steering_input']     = steer
-            shared_data['acceleration_input'] = accel
-
-    with data_lock:
-        shared_data['last_token'] = detected
-
+    if front_frame is not None:
+        # write your processing here
+        pass
 
 def send_controls_task():
+    #This is where you send the control commands to the car using the control_conn
     global control_conn
     if control_conn is None:
         return
-
-    with data_lock:
-        steering_input     = shared_data['steering_input']
-        acceleration_input = shared_data['acceleration_input']
-        low_light_active   = shared_data['low_light_active']
-
-    if low_light_active:
-        # Challenge 1: send recovery signal as-is, never override
-        acceleration_input = -1.0
-        steering_input     = 0.0
-    else:
-        # Normal drive: always full throttle
-        acceleration_input = 1.0
+    
+    #these are the variables used to control the car
+    #steering_input: -1.0 to 1.0 (left to right)
+    #acceleration_input: -1.0 to 1.0 (reverse to forward)
+    #this example always accelerate forward
+    steering_input = 0.0
+    acceleration_input = 1.0
 
     try:
+        # Pack and send the control command
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
@@ -399,7 +250,7 @@ if __name__ == '__main__':
     # Concurrency refers to the number of instances of the task that can run at the same time
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
-    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.HIGH, execute_func=processing_task)
+    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
     
     # Start tasks to run concurrently
