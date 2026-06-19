@@ -9,26 +9,18 @@ import cv2
 import numpy as np
 import time
 
-from config import NUM_LANES, LOW_BRIGHTNESS_THRESHOLD, BLANK_LANE_THRESHOLD, DARK_FRAME_REQUIRED
+from config import NUM_LANES, LOW_BRIGHTNESS_THRESHOLD, BLANK_LANE_THRESHOLD
 from core import shared_data, data_lock
-
-# Consecutive dark-frame counter — prevents single shadows / dark tokens
-# from falsely triggering LOW_LIGHT mode.
-_dark_frame_count = 0
 
 
 # ---------------------------------------------------------
 # Challenge 1 — Brightness Task (HIGH priority, 5 ms period)
 #
 # Reads one frame, computes the mean road brightness, and flips low_light_active.
-# Requires DARK_FRAME_REQUIRED consecutive dark frames before activating to avoid
-# false triggers from road shadows or dark tokens.
 # Kept independent of the heavier detection_task so the light-off event is caught
 # immediately and reliably.
 # ---------------------------------------------------------
 def brightness_task():
-    global _dark_frame_count
-
     with data_lock:
         frame = shared_data['latest_front_frame']
 
@@ -47,24 +39,17 @@ def brightness_task():
 
     if not currently_active:
         if brightness < LOW_BRIGHTNESS_THRESHOLD:
-            _dark_frame_count += 1
-            # Require DARK_FRAME_REQUIRED consecutive dark frames before activating
-            if _dark_frame_count >= DARK_FRAME_REQUIRED:
-                print(f"[LOW LIGHT] Detected after {_dark_frame_count} dark frames! "
-                      f"Road Brightness={brightness:.1f}. Sending acceleration=-1.0.")
-                with data_lock:
-                    shared_data['low_light_active']     = True
-                    shared_data['low_light_start_time'] = now
-                    shared_data['event_active']         = 'low_brightness'
-        else:
-            _dark_frame_count = 0   # reset on any bright frame
+            print(f"[LOW LIGHT] Detected! Road Brightness={brightness:.1f}. Sending acceleration=-1.0.")
+            with data_lock:
+                shared_data['low_light_active']     = True
+                shared_data['low_light_start_time'] = now
+                shared_data['event_active']         = 'low_brightness'
     else:
         if int(now * 10) % 5 == 0:
             print(f"[LOW LIGHT] Waiting for light... Road Brightness={brightness:.1f}")
 
         # Hysteresis: recover a bit above the trigger so the state doesn't flicker.
         if brightness > LOW_BRIGHTNESS_THRESHOLD + 2:
-            _dark_frame_count = 0
             with data_lock:
                 elapsed = now - shared_data['low_light_start_time']
             print(f"[LOW LIGHT] Recovered after {elapsed:.2f}s! Road Brightness={brightness:.1f}. Resuming.")
