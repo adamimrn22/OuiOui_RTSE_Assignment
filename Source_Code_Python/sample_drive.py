@@ -22,7 +22,7 @@ from core import (RTTask, TaskPriority, shared_data, data_lock,
                   read_front_camera_task, read_back_camera_task)
 from config import CENTER_LANE
 from low_light import brightness_task
-from token_detection import detection_task
+from token_detection import detection_task, back_detection_task
 from steering import decision_task, send_controls_task, police_watchdog_task
 from visualization import draw_debug
 
@@ -39,12 +39,13 @@ if __name__ == '__main__':
     print("\n--- Starting Real-Time Tasks ---\n")
     print("RMS Schedule:")
     print("  SendControls   : 2ms   | HIGH   — always sends latest control")
-    print("  ReadFrontCamera: 5ms   | HIGH   — feeds brightness + detection pipeline")
+    print("  ReadFrontCamera: 5ms   | HIGH   — feeds brightness + front detection")
     print("  BrightnessTask : 5ms   | HIGH   — Challenge 1: hard real-time light detection")
     print("  DecisionTask   : 5ms   | HIGH   — 5-lane scoring state machine, no cv2")
     print("  ReadBackCamera : 10ms  | MEDIUM — back camera feed")
-    print("  DetectionTask  : 10ms  | MEDIUM — heavy cv2: coins + police + chasing car")
-    print("  PoliceWatchdog : 100ms | LOW    — Challenge 3: deadline countdown\n")
+    print("  DetectionTask  : 10ms  | MEDIUM — front cv2: coins + police car")
+    print("  BackDetectTask : 10ms  | MEDIUM — Ch2: chasing car (isolated from front cv2)")
+    print("  EventsWatchdog : 100ms | LOW    — Ch2+Ch3 deadline countdown\n")
 
     t_send_controls   = RTTask("SendControls",    period=0.002, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
     t_front_camera    = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH,   execute_func=read_front_camera_task)
@@ -52,7 +53,8 @@ if __name__ == '__main__':
     t_decision        = RTTask("DecisionTask",    period=0.005, priority=TaskPriority.HIGH,   execute_func=decision_task)
     t_back_camera     = RTTask("ReadBackCamera",  period=0.010, priority=TaskPriority.MEDIUM, execute_func=read_back_camera_task)
     t_detection       = RTTask("DetectionTask",   period=0.010, priority=TaskPriority.MEDIUM, execute_func=detection_task)
-    t_police_watchdog = RTTask("PoliceWatchdog",  period=0.100, priority=TaskPriority.LOW,    execute_func=police_watchdog_task)
+    t_back_detection  = RTTask("BackDetectTask",  period=0.010, priority=TaskPriority.MEDIUM, execute_func=back_detection_task)
+    t_police_watchdog = RTTask("EventsWatchdog",  period=0.100, priority=TaskPriority.LOW,    execute_func=police_watchdog_task)
 
     t_send_controls.start()
     t_front_camera.start()
@@ -60,6 +62,7 @@ if __name__ == '__main__':
     t_decision.start()
     t_back_camera.start()
     t_detection.start()
+    t_back_detection.start()
     t_police_watchdog.start()
 
     try:
@@ -98,6 +101,7 @@ if __name__ == '__main__':
     t_decision.join()
     t_back_camera.join()
     t_detection.join()
+    t_back_detection.join()
     t_police_watchdog.join()
 
     if core.front_camera_sock:

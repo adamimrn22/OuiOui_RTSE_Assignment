@@ -187,6 +187,7 @@ def setup_control_server():
 # Camera Read Tasks
 # ---------------------------------------------------------
 def read_single_camera(sock, window_name, data_key):
+    global is_running
     if sock is None:
         return
 
@@ -195,6 +196,9 @@ def read_single_camera(sock, window_name, data_key):
         sock.settimeout(None)
         length_bytes = sock.recv(4)
         if not length_bytes:
+            # Game closed the socket cleanly — stop the agent
+            print(f"[{window_name}] Socket closed by game. Stopping...")
+            is_running = False
             return
 
         image_length   = int.from_bytes(length_bytes, 'little')

@@ -52,21 +52,21 @@ LANE_COMMIT_S       = 0.35
 # Lane scoring weights
 # ---------------------------------------------------------
 SCORE_CLEAR          =   60.0
-SCORE_LANE_CHANGE    =   38.0
-SCORE_GREEN_REWARD   =  170.0
-GREEN_WEIGHT_FLOOR   =   0.8
+SCORE_LANE_CHANGE    =   25.0   # moderate: switches for green but resists random drifts
+SCORE_GREEN_REWARD   =  280.0   # raised: green tokens are the primary objective
+GREEN_WEIGHT_FLOOR   =   0.7
 SCORE_RED_PENALTY    =  220.0
-SCORE_YELLOW_PENALTY =  420.0
+SCORE_YELLOW_PENALTY =  480.0   # raised: avoid yellow harder
 SCORE_UNKNOWN_PENALTY=  140.0
 SCORE_POLICE_BLOB    = 1000.0
 SCORE_BLANKED_LANE   =  130.0
 SCORE_RED_TARGET     =  260.0
-SWITCH_MARGIN        =   40.0
+SWITCH_MARGIN        =   30.0   # slight hysteresis prevents rapid lane oscillation
 
 # ---------------------------------------------------------
 # Token (coin) detection
 # ---------------------------------------------------------
-TOKEN_MIN_AREA       = 30
+TOKEN_MIN_AREA       = 20   # lowered: detect smaller/farther tokens earlier
 GRAY_MIN_AREA        = 120
 TOKEN_MIN_EXTENT     = 0.30
 TOKEN_AR_LO, TOKEN_AR_HI = 0.4, 2.6
@@ -76,12 +76,19 @@ LOW_BRIGHTNESS_THRESHOLD = 25
 BLANK_LANE_THRESHOLD     = 12
 
 # Challenge 2 — Chasing Car (TEAL/CYAN car in the back camera)
-CHASING_MIN_AREA   = 1500
+CHASING_MIN_AREA   = 700    # lowered: detect chasing car earlier
 CHASING_GRACE_S    = 1.0
-CHASING_2ND_WINDOW = 3.0
+CHASING_1ST_WINDOW = 10.0   # seconds to survive the 1st chasing-car appearance
+CHASING_2ND_WINDOW = 3.0    # seconds to survive the 2nd appearance (tighter deadline)
 
-# Challenge 3 — Police Car (collect a RED token before the deadline)
+# Challenge 3 - Police Car (collect a RED token before the deadline)
 POLICE_DEADLINE          = 10.0
 POLICE_URGENT_THRESHOLD  = 3.0
 POLICE_MIN_AREA          = 2000
 POLICE_ABSENT_GRACE      = 1.5
+
+# Low Light - consecutive dark frames required before activating
+DARK_FRAME_REQUIRED = 3
+
+# Lane geometry
+PROXIMITY_AREA_NORM = 4000.0

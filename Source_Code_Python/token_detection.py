@@ -20,35 +20,55 @@ from lane_geometry import lane_of_x, road_polygon
 from low_light import detect_blanked_lanes
 
 
+# Module-level state for back-camera motion detection
+_prev_back_gray = None
+
+
 # ---------------------------------------------------------
 # Challenge 2 — Chasing car (TEAL, back camera)
 # ---------------------------------------------------------
-def detect_chasing_car(frame):
+def detect_chasing_car(frame, prev_gray=None):
     """
-    The chasing car is TEAL (hue ~86-104) — distinct from the grass (plain green,
-    hue ~60). Require teal hue + SIZE + SOLIDITY in the CENTRAL ROAD band of the
-    back frame so grass on curves isn't mistaken for the car.
+    Dual-mode chasing car detection:
+    1. HSV colour: wider teal range [78-115] catches colour variations across
+       lighting conditions. Side margins widened to 15% so an evading car on
+       the edge of the frame is still seen.
+    2. Motion fallback: if colour fails, frame differencing catches any large
+       fast-moving object — the chasing car is the only thing that moves that
+       quickly in the back camera.
     """
     h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    teal_mask = cv2.inRange(hsv, np.array([86, 70, 70]), np.array([104, 255, 255]))
 
-    teal_mask[:int(h * 0.25), :] = 0          # ignore sky/horizon
-    teal_mask[:, :int(w * 0.25)] = 0          # ignore left margin
-    teal_mask[:, int(w * 0.75):] = 0          # ignore right margin
+    # --- Colour path (primary) ---
+    teal_mask = cv2.inRange(hsv, np.array([78, 40, 40]), np.array([115, 255, 255]))
+    teal_mask[:int(h * 0.20), :] = 0          # ignore sky/horizon
+    teal_mask[:, :int(w * 0.15)] = 0          # widened: ignore narrow left margin
+    teal_mask[:, int(w * 0.85):] = 0          # widened: ignore narrow right margin
 
     contours, _ = cv2.findContours(teal_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return False
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        area    = cv2.contourArea(largest)
+        if area >= CHASING_MIN_AREA:
+            x, y, bw, bh = cv2.boundingRect(largest)
+            solidity = area / max(1, bw * bh)
+            if solidity > 0.30:   # lowered: angled car is less solid
+                return True
 
-    largest = max(contours, key=cv2.contourArea)
-    area    = cv2.contourArea(largest)
-    if area < CHASING_MIN_AREA:
-        return False   # too small => a coin, not the car
+    # --- Motion fallback (catches car even if colour differs) ---
+    if prev_gray is not None:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        diff = cv2.absdiff(gray, prev_gray)
+        _, motion_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+        motion_mask[:int(h * 0.20), :] = 0    # ignore horizon
+        motion_mask[:, :int(w * 0.20)] = 0
+        motion_mask[:, int(w * 0.80):] = 0
+        motion_score = np.count_nonzero(motion_mask)
+        if motion_score > CHASING_MIN_AREA * 1.5:  # large fast object = car
+            return True
 
-    x, y, bw, bh = cv2.boundingRect(largest)
-    solidity     = area / max(1, bw * bh)
-    return solidity > 0.40
+    return False
 
 
 # ---------------------------------------------------------
@@ -57,9 +77,11 @@ def detect_chasing_car(frame):
 def detect_police_car(hsv, frame_h, frame_w):
     """Large BLUE object on the road = police car. Returns its bbox or None."""
     blue_mask = cv2.inRange(hsv, np.array([108, 90, 90]), np.array([128, 255, 255]))
-    # Search well BELOW the skyline — blue/purple city buildings sit at the horizon.
-    roi_top = int(frame_h * 0.52)
-    roi_bot = int(frame_h * 0.85)
+    # Widened ROI: 0.40 catches the police car while it is still far away;
+    # 0.90 catches it when it is close. Buildings sit above 0.40 and are
+    # rejected by the aspect-ratio / width guard below.
+    roi_top = int(frame_h * 0.40)
+    roi_bot = int(frame_h * 0.90)
     blue_mask[:roi_top, :] = 0
     blue_mask[roi_bot:,  :] = 0
 
@@ -186,8 +208,49 @@ def detect_with_yolo(frame, back_frame, frame_h, frame_w):
 
 
 # ---------------------------------------------------------
+# Back Detection Task (MEDIUM priority, 10 ms period)
+# Isolated back-camera pipeline so it does not compete with front-camera
+# processing for the same 10 ms budget. Handles Challenge 2 (chasing car).
+# ---------------------------------------------------------
+def back_detection_task():
+    global _prev_back_gray
+    with data_lock:
+        back_frame     = shared_data['latest_back_frame']
+        chasing_active = shared_data['chasing_active']
+
+    if back_frame is None:
+        return
+
+    chasing_detected = detect_chasing_car(back_frame, _prev_back_gray)
+    _prev_back_gray  = cv2.cvtColor(back_frame, cv2.COLOR_BGR2GRAY)
+    now = time.time()
+
+    if chasing_detected:
+        if not chasing_active:
+            with data_lock:
+                shared_data['chasing_appearance_count'] += 1
+                count = shared_data['chasing_appearance_count']
+            print(f"[CHASING CAR] Appearance #{count} detected behind us! Evasive action!")
+        with data_lock:
+            shared_data['chasing_active']     = True
+            shared_data['chasing_start_time'] = shared_data['chasing_start_time'] if chasing_active else now
+            shared_data['chasing_last_seen']  = now
+            shared_data['event_active']       = 'chasing'
+    else:
+        with data_lock:
+            chasing_last_seen = shared_data['chasing_last_seen']
+        if chasing_active and (now - chasing_last_seen) > CHASING_GRACE_S:
+            print("[CHASING CAR] Evaded / gone. Returning to normal mode.")
+            with data_lock:
+                shared_data['chasing_active'] = False
+                if shared_data.get('event_active') == 'chasing':
+                    shared_data['event_active'] = None
+
+
+# ---------------------------------------------------------
 # Detection Task (MEDIUM priority, 10 ms period)
-# Runs all the perception and publishes tokens / police / chasing state.
+# Front-camera only: tokens + police car + blanked lanes.
+# Chasing car detection is now handled by back_detection_task (separate task).
 # ---------------------------------------------------------
 def detection_task():
     with data_lock:
@@ -210,69 +273,27 @@ def detection_task():
     blanked_lanes = detect_blanked_lanes(frame)
 
     if USE_YOLO:
+        # YOLO handles all detection including chasing car in one pass
         tokens, police_bbox, chasing_detected = detect_with_yolo(frame, back_frame, h, w)
-    else:
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        tokens      = classify_tokens(hsv, h, w, enable_gray=any(blanked_lanes))
-        police_bbox = detect_police_car(hsv, h, w)
-        chasing_detected = detect_chasing_car(back_frame) if back_frame is not None else False
-
-    now = time.time()
-    with data_lock:
-        police_active  = shared_data['police_active']
-        chasing_active = shared_data['chasing_active']
-
-    # --- Chasing state update (track 1st vs 2nd appearance) ---
-    if chasing_detected:
-        if not chasing_active:
-            with data_lock:
-                shared_data['chasing_appearance_count'] += 1
-                count = shared_data['chasing_appearance_count']
-            print(f"[CHASING CAR] Appearance #{count} detected behind us! Evasive action!")
+        now = time.time()
         with data_lock:
-            shared_data['chasing_active']     = True
-            shared_data['chasing_start_time'] = shared_data['chasing_start_time'] if chasing_active else now
-            shared_data['chasing_last_seen']  = now
-            shared_data['event_active']       = 'chasing'
-    else:
-        with data_lock:
-            chasing_last_seen = shared_data['chasing_last_seen']
-        if chasing_active and (now - chasing_last_seen) > CHASING_GRACE_S:
-            print("[CHASING CAR] Evaded / gone. Returning to normal mode.")
+            police_active  = shared_data['police_active']
+            chasing_active = shared_data['chasing_active']
+        # Update chasing state from YOLO (back_detection_task only runs in HSV mode)
+        if chasing_detected:
+            if not chasing_active:
+                with data_lock:
+                    shared_data['chasing_appearance_count'] += 1
             with data_lock:
-                shared_data['chasing_active'] = False
-                if shared_data.get('event_active') == 'chasing':
-                    shared_data['event_active'] = None
-
-    # --- Police state update ---
-    if police_bbox is not None:
-        if not police_active:
-            print("[POLICE] Police car detected! 10 seconds to collect a RED token!")
-        with data_lock:
-            shared_data['police_active']     = True
-            shared_data['police_start_time'] = shared_data['police_start_time'] if police_active else now
-            shared_data['police_bbox']       = police_bbox
-            shared_data['police_bbox_time']  = now
-            shared_data['police_last_seen']  = now
-            shared_data['event_active']      = 'police'
-    else:
-        with data_lock:
-            last_seen      = shared_data['police_last_seen']
-            last_bbox_time = shared_data['police_bbox_time']
-        if police_active and (now - last_seen) > POLICE_ABSENT_GRACE:
-            print("[POLICE] Police car gone — returning to normal mode.")
+                shared_data['chasing_active']     = True
+                shared_data['chasing_start_time'] = shared_data['chasing_start_time'] if chasing_active else now
+                shared_data['chasing_last_seen']  = now
+                shared_data['event_active']       = 'chasing'
+        else:
             with data_lock:
-                shared_data['police_active'] = False
-                shared_data['police_urgent'] = False
-                shared_data['police_bbox']   = None
-                shared_data['event_active']  = None
-        elif (now - last_bbox_time) > 1.0:
-            with data_lock:
-                shared_data['police_bbox'] = None
-
-    # --- Single brief write-back ---
-    with data_lock:
-        shared_data['tokens']        = tokens
-        shared_data['blanked_lanes'] = blanked_lanes
-        shared_data['frame_w']       = w
-        shared_data['frame_h']       = h
+                chasing_last_seen = shared_data['chasing_last_seen']
+            if chasing_active and (now - chasing_last_seen) > CHASING_GRACE_S:
+                with data_lock:
+                    shared_data['chasing_active'] = False
+                    if shared_data.get('event_active') == 'chasing':
+                        shared_data['event_active'] = None
