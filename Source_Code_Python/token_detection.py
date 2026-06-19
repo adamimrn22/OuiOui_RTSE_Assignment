@@ -15,7 +15,9 @@ from config import (USE_YOLO, NUM_LANES, TOKEN_MIN_AREA, GRAY_MIN_AREA,
                     CHASING_MIN_AREA, CHASING_GRACE_S, CHASING_SOLIDITY_MIN,
                     CHASING_ROI_TOP_FRAC, CHASING_ROI_LEFT_FRAC, CHASING_ROI_RIGHT_FRAC,
                     POLICE_MIN_AREA, POLICE_ABSENT_GRACE,
-                    YOLO_MODEL_PATH, YOLO_CONF)
+                    YOLO_MODEL_PATH, YOLO_CONF,
+                    TACTICAL_NET_GREEN_TARGET,
+                    GOLDEN_LANE_HUD_TOP_FRAC, GOLDEN_LANE_HUD_BOT_FRAC)
 from core import shared_data, data_lock
 from lane_geometry import lane_of_x, road_polygon, road_bounds
 from low_light import detect_blanked_lanes
@@ -396,6 +398,42 @@ def detect_with_yolo(frame, back_frame, frame_h, frame_w):
 
 
 # ---------------------------------------------------------
+# Golden Lane — HUD text detection (front camera, top strip)
+# The game flashes bright yellow "LANE N — ALL GREEN!" in the HUD.
+# We mask the yellow pixels, find the blob centroid, and map it to a lane index.
+# ---------------------------------------------------------
+_GOLD_TEXT_HSV_LO = np.array([18, 160, 180])   # bright warm yellow
+_GOLD_TEXT_HSV_HI = np.array([38, 255, 255])
+_GOLD_MIN_AREA    = 80                          # minimum yellow-pixel area to count
+
+def detect_golden_lane_hud(frame):
+    """
+    Scan the top HUD band for the bright-yellow 'LANE N — ALL GREEN!' text.
+    Returns (lane_index, detected): lane_index is 0-indexed (0-4), or -1 if not found.
+    """
+    if frame is None:
+        return -1
+    h, w = frame.shape[:2]
+    y0 = int(GOLDEN_LANE_HUD_TOP_FRAC * h)
+    y1 = int(GOLDEN_LANE_HUD_BOT_FRAC * h)
+    hud = frame[y0:y1, :]
+    hsv  = cv2.cvtColor(hud, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, _GOLD_TEXT_HSV_LO, _GOLD_TEXT_HSV_HI)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return -1
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < _GOLD_MIN_AREA:
+        return -1
+    x, y, bw, bh = cv2.boundingRect(largest)
+    text_cx   = x + bw // 2
+    lane_index = int(round((text_cx / w) * NUM_LANES - 0.5))
+    return max(0, min(NUM_LANES - 1, lane_index))
+
+
+# ---------------------------------------------------------
 # Detection Task (MEDIUM priority, 10 ms period)
 # Runs all the perception and publishes tokens / police / chasing state.
 # ---------------------------------------------------------
@@ -498,3 +536,96 @@ def detection_task():
         shared_data['chasing_mask_roi_top']    = chase_dbg['roi_top']
         shared_data['chasing_mask_roi_left']   = chase_dbg['roi_left']
         shared_data['chasing_mask_roi_right']  = chase_dbg['roi_right']
+
+    # ----------------------------------------------------------------
+    # Golden Lane — detect HUD text and publish raw detection result.
+    # The watchdog in steering.py owns the timer, pass check, and window state.
+    # ----------------------------------------------------------------
+    detected_gl_lane = detect_golden_lane_hud(frame)
+    with data_lock:
+        shared_data['golden_lane_detected_raw']  = detected_gl_lane >= 0
+        shared_data['golden_lane_detected_lane'] = detected_gl_lane
+
+    # ----------------------------------------------------------------
+    # Golden Lane — override token colours in the active golden lane
+    # ----------------------------------------------------------------
+    with data_lock:
+        gl_active = shared_data['golden_lane_active']
+        gl_lane   = shared_data['golden_lane_number']
+
+    if gl_active and gl_lane >= 0:
+        for t in tokens:
+            if t.get('lane', -1) == gl_lane:
+                t['color'] = 'green'        # force green for scoring
+        # Re-publish the modified token list
+        with data_lock:
+            shared_data['tokens'] = tokens
+
+    # ----------------------------------------------------------------
+    # Tactical scoring — count tokens that have just been picked up
+    # (a token is "collected" when it was present last frame but is gone now)
+    # ----------------------------------------------------------------
+    _update_tactical_score(tokens)
+
+
+# ---------------------------------------------------------
+# Tactical score helper — token disappearance = pickup
+# ---------------------------------------------------------
+# We compare each previous token's (lane, color) pair against the current frame.
+# If a previous token is no longer represented, the car collected it.
+
+_PICKUP_MATCH_RADIUS_PX = 60   # max pixel distance to still be "the same token"
+
+def _token_still_present(prev_tok, current_tokens):
+    """Return True if prev_tok has a matching token (same colour, nearby) this frame."""
+    px, py = prev_tok['x'], prev_tok['y']
+    col    = prev_tok['color']
+    for t in current_tokens:
+        if t['color'] == col:
+            dx = t['x'] - px
+            dy = t['y'] - py
+            if (dx * dx + dy * dy) <= _PICKUP_MATCH_RADIUS_PX ** 2:
+                return True
+    return False
+
+
+def _update_tactical_score(current_tokens):
+    """
+    Compare current_tokens against the previous frame's token list.
+    Tokens that have disappeared are counted as collected.
+    Only counts green and red tokens (yellow = obstacle, not scored tactically).
+    """
+    with data_lock:
+        prev_tokens   = shared_data.get('tactical_prev_tokens', [])
+        green_count   = shared_data['tactical_green_collected']
+        red_count     = shared_data['tactical_red_collected']
+
+    new_green = 0
+    new_red   = 0
+    for pt in prev_tokens:
+        if pt['color'] not in ('green', 'red'):
+            continue
+        if pt.get('is_curb_like', False):
+            continue
+        if not _token_still_present(pt, current_tokens):
+            # Token disappeared — car drove over it
+            if pt['color'] == 'green':
+                new_green += 1
+            else:
+                new_red += 1
+
+    if new_green > 0 or new_red > 0:
+        net = (green_count + new_green) - (red_count + new_red)
+        print(f"[TACTICAL] +{new_green} green  +{new_red} red  "
+              f"(net={net})")
+        with data_lock:
+            shared_data['tactical_green_collected'] += new_green
+            shared_data['tactical_red_collected']   += new_red
+            shared_data['tactical_net_green']        = (
+                shared_data['tactical_green_collected']
+                - shared_data['tactical_red_collected']
+            )
+
+    # Store current list for the next frame comparison
+    with data_lock:
+        shared_data['tactical_prev_tokens'] = list(current_tokens)

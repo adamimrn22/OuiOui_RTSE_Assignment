@@ -97,3 +97,15 @@ POLICE_DEADLINE          = 10.0
 POLICE_URGENT_THRESHOLD  = 3.0
 POLICE_MIN_AREA          = 2000
 POLICE_ABSENT_GRACE      = 1.5
+
+# Golden Lane event
+# The game displays bright yellow text "LANE N — ALL GREEN!" in the top HUD strip.
+# We detect the yellow-pixel centroid in that strip, then parse the digit.
+GOLDEN_LANE_DURATION     = 5.0     # window length in seconds
+GOLDEN_LANE_HUD_TOP_FRAC = 0.00    # top of HUD scan band (fraction of frame height)
+GOLDEN_LANE_HUD_BOT_FRAC = 0.15    # bottom of HUD scan band
+GOLDEN_LANE_SCORE_BOOST  = 3000.0  # added to the target lane score during the window
+GOLDEN_LANE_ABSENT_GRACE = 0.5     # seconds to hold detection after text disappears
+
+# Tactical win condition
+TACTICAL_NET_GREEN_TARGET = 60     # net (green collected − red collected) to win

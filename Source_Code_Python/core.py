@@ -24,8 +24,9 @@ class DriveState:
     LOW_LIGHT       = 'LOW_LIGHT'        # 1 — restore the light, nothing else
     CHASING_EVASION = 'CHASING_EVASION'  # 2 — green car behind, survive
     POLICE          = 'POLICE'           # 3 — collect a red token in time
-    COIN_AVOID      = 'COIN_AVOID'       # 4 — dangerous coin in our lane
-    NORMAL          = 'NORMAL'           # 5 — cruise + collect green
+    GOLDEN_LANE     = 'GOLDEN_LANE'      # 4 — drive to the golden lane within 5 s
+    COIN_AVOID      = 'COIN_AVOID'       # 5 — dangerous coin in our lane
+    NORMAL          = 'NORMAL'           # 6 — cruise + collect green
 
 # ---------------------------------------------------------
 # Shared Resources
@@ -78,6 +79,23 @@ shared_data = {
     'chasing_mask_roi_top':     0,
     'chasing_mask_roi_left':    0,
     'chasing_mask_roi_right':   0,
+
+    # Golden Lane event
+    'golden_lane_active':         False,   # True during the 5 s golden window
+    'golden_lane_number':         -1,      # 0-indexed lane (0–4), -1 = none
+    'golden_lane_start':          0.0,     # time.time() when window began
+    'golden_lane_last_seen':      0.0,     # last frame we saw the HUD text
+    'golden_lane_passed':         False,   # True if car was in the lane when window expired
+    'golden_lane_pass_count':     0,       # how many golden lane events have been passed
+    'golden_lane_detected_raw':   False,   # written each frame by detection_task
+    'golden_lane_detected_lane':  -1,      # raw detected lane index from HUD (-1 = none)
+
+    # Tactical win condition
+    'tactical_green_collected': 0,       # cumulative green tokens driven over
+    'tactical_red_collected':   0,       # cumulative red tokens driven over
+    'tactical_net_green':       0,       # green - red
+    'tactical_win':             False,   # True when net >= 60 AND pass_count >= 1
+    'tactical_prev_tokens':     [],      # token list from previous frame (for pickup detection)
 }
 data_lock = threading.Lock()
 is_running = True

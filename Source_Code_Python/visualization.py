@@ -115,6 +115,30 @@ def _read_chase_debug():
     return defaults
 
 
+def _read_golden_debug():
+    """Read golden-lane and tactical fields from shared_data."""
+    defaults = {
+        'golden_lane_active':       False,
+        'golden_lane_number':       -1,
+        'golden_lane_start':        0.0,
+        'golden_lane_passed':       False,
+        'golden_lane_pass_count':   0,
+        'tactical_green_collected': 0,
+        'tactical_red_collected':   0,
+        'tactical_net_green':       0,
+        'tactical_win':             False,
+    }
+    try:
+        from core import shared_data, data_lock
+        with data_lock:
+            for key in defaults:
+                if key in shared_data:
+                    defaults[key] = shared_data[key]
+    except Exception:
+        pass
+    return defaults
+
+
 def draw_back_debug(frame):
     """Back-camera overlay for chasing-car detection debug."""
     if frame is None:
@@ -342,5 +366,67 @@ def draw_debug(frame, tokens, scores, state, target_lane, target_x, lookahead_y)
     if scores:
         cv2.putText(out, "scores: " + " ".join(f"{s:.0f}" for s in scores),
                     (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    # ----------------------------------------------------------------
+    # Golden Lane overlay
+    # ----------------------------------------------------------------
+    gold = _read_golden_debug()
+    import time as _time
+    now_viz = _time.time()
+
+    if gold['golden_lane_active']:
+        gl_lane    = gold['golden_lane_number']
+        gl_start   = gold['golden_lane_start']
+        remaining  = max(0.0, 5.0 - (now_viz - gl_start))
+
+        # Tint the entire golden-lane column with a semi-transparent green flash
+        if 0 <= gl_lane < NUM_LANES:
+            from config import GOLDEN_LANE_HUD_BOT_FRAC
+            from lane_geometry import road_bounds
+            tint_ys = np.linspace(int(ROAD_HORIZON_FRAC * h), h - 1, 30).astype(int)
+            gl_pts = []
+            for yy in tint_ys:
+                left_b, right_b = road_bounds(yy, w, h)
+                lane_w = (right_b - left_b) / NUM_LANES
+                xl = int(left_b + gl_lane * lane_w)
+                xr = int(left_b + (gl_lane + 1) * lane_w)
+                gl_pts += [(xl, yy), (xr, yy)]
+            # Draw translucent green strip by blending a filled polygon
+            overlay = out.copy()
+            poly_pts = []
+            for yy in tint_ys:
+                left_b, right_b = road_bounds(yy, w, h)
+                lane_w = (right_b - left_b) / NUM_LANES
+                xl = int(left_b + gl_lane * lane_w)
+                poly_pts.append([xl, int(yy)])
+            for yy in reversed(tint_ys):
+                left_b, right_b = road_bounds(yy, w, h)
+                lane_w = (right_b - left_b) / NUM_LANES
+                xr = int(left_b + (gl_lane + 1) * lane_w)
+                poly_pts.append([xr, int(yy)])
+            poly_arr = np.array(poly_pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(overlay, [poly_arr], (0, 220, 80))
+            out = cv2.addWeighted(out, 0.72, overlay, 0.28, 0)
+
+        # Golden Lane countdown banner (centered, bright gold text)
+        banner = f"GOLDEN LANE {_human_lane(gl_lane)}  {remaining:.1f}s"
+        (tw, th_), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_DUPLEX, 0.85, 2)
+        bx = (w - tw) // 2
+        by = int(h * 0.22)
+        cv2.rectangle(out, (bx - 8, by - th_ - 6), (bx + tw + 8, by + 6), (0, 0, 0), -1)
+        cv2.putText(out, banner, (bx, by), cv2.FONT_HERSHEY_DUPLEX,
+                    0.85, (0, 220, 255), 2, cv2.LINE_AA)
+
+    # ----------------------------------------------------------------
+    # Tactical win condition status (bottom-right corner)
+    # ----------------------------------------------------------------
+    net        = gold['tactical_net_green']
+    pass_count = gold['golden_lane_pass_count']
+    win        = gold['tactical_win']
+    tac_col    = (0, 255, 120) if win else (200, 200, 100)
+    tac_label  = "TACTICAL WIN!" if win else f"TACTICAL: net={net:+d}/60  passes={pass_count}"
+    (ttw, tth_), _ = cv2.getTextSize(tac_label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+    cv2.putText(out, tac_label, (w - ttw - 8, h - 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, tac_col, 1, cv2.LINE_AA)
 
     return out

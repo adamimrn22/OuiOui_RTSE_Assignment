@@ -19,7 +19,9 @@ from config import (NUM_LANES, CENTER_LANE,
                     SCORE_RED_TARGET, SWITCH_MARGIN, LANE_CHANGE_ESTIMATE_S,
                     GREEN_CLUSTER_BONUS, GREEN_CLUSTER_COUNT_BONUS,
                     RED_UNSAFE_PENALTY, YELLOW_SOFT_PENALTY, RED_UNSAFE_Y_FRAC,
-                    POLICE_DEADLINE, POLICE_URGENT_THRESHOLD)
+                    POLICE_DEADLINE, POLICE_URGENT_THRESHOLD,
+                    GOLDEN_LANE_SCORE_BOOST, GOLDEN_LANE_DURATION,
+                    GOLDEN_LANE_ABSENT_GRACE, TACTICAL_NET_GREEN_TARGET)
 import core
 from core import shared_data, data_lock, DriveState
 from lane_geometry import lane_of_x, lane_center_at_row, car_center_x, proximity_weight
@@ -130,6 +132,13 @@ def score_lanes(tokens, police_bbox, blanked_lanes, current_lane,
     for i in range(NUM_LANES):
         if i < len(blanked_lanes) and blanked_lanes[i]:
             scores[i] -= SCORE_BLANKED_LANE
+
+    # Golden Lane boost: strongly favour the target lane during the 5 s window
+    with data_lock:
+        gl_active = shared_data.get('golden_lane_active', False)
+        gl_lane   = shared_data.get('golden_lane_number', -1)
+    if gl_active and 0 <= gl_lane < NUM_LANES:
+        scores[gl_lane] += GOLDEN_LANE_SCORE_BOOST
 
     return scores, summary
 
@@ -255,6 +264,102 @@ def police_watchdog_task():
 
 
 # ---------------------------------------------------------
+# Golden Lane Watchdog Task (LOW priority, 100 ms)
+# Reads the raw HUD detection published by detection_task and manages
+# the 5 s event window, pass/miss recording, and the Tactical win check.
+# Mirrors police_watchdog_task in structure.
+# ---------------------------------------------------------
+_gl_last_print_s = -1   # throttle countdown prints to once per second
+
+def golden_lane_watchdog_task():
+    global _gl_last_print_s
+    now = time.time()
+
+    with data_lock:
+        detected_raw  = shared_data.get('golden_lane_detected_raw',  False)
+        detected_lane = shared_data.get('golden_lane_detected_lane', -1)
+        gl_active     = shared_data['golden_lane_active']
+        gl_lane       = shared_data['golden_lane_number']
+        gl_start      = shared_data['golden_lane_start']
+        gl_last_seen  = shared_data['golden_lane_last_seen']
+        pass_count    = shared_data['golden_lane_pass_count']
+        estimated_lane = shared_data.get('estimated_lane', CENTER_LANE)
+
+    # --- New detection: start or refresh the window ---
+    if detected_raw and detected_lane >= 0:
+        with data_lock:
+            shared_data['golden_lane_last_seen'] = now
+
+        if not gl_active:
+            with data_lock:
+                shared_data['golden_lane_active'] = True
+                shared_data['golden_lane_number'] = detected_lane
+                shared_data['golden_lane_start']  = now
+                shared_data['golden_lane_passed'] = False
+                shared_data['event_active']        = 'golden_lane'
+            print(f"[GOLDEN LANE] Lane {detected_lane + 1} detected! "
+                  f"{GOLDEN_LANE_DURATION:.0f} s window started.")
+            _gl_last_print_s = int(now)
+        elif detected_lane != gl_lane:
+            with data_lock:
+                shared_data['golden_lane_number'] = detected_lane
+            print(f"[GOLDEN LANE] Lane corrected to {detected_lane + 1}.")
+
+    # --- Nothing detected this frame: apply grace period ---
+    if not detected_raw and gl_active:
+        if (now - gl_last_seen) > GOLDEN_LANE_ABSENT_GRACE:
+            _expire_golden_window(now, estimated_lane, gl_lane, pass_count)
+            return
+
+    # --- Window active: check expiry and print countdown ---
+    if not gl_active:
+        return
+
+    elapsed   = now - gl_start
+    remaining = GOLDEN_LANE_DURATION - elapsed
+
+    if remaining <= 0:
+        _expire_golden_window(now, estimated_lane, gl_lane, pass_count)
+        return
+
+    # Countdown print once per second
+    if int(now) != _gl_last_print_s:
+        print(f"[GOLDEN LANE] Lane {gl_lane + 1} — {remaining:.1f} s remaining.")
+        _gl_last_print_s = int(now)
+
+
+def _expire_golden_window(now, estimated_lane, gl_lane, prev_pass_count):
+    """Record pass/miss and clear the golden lane window. Then check Tactical win."""
+    in_lane = (int(estimated_lane) == int(gl_lane)) if gl_lane >= 0 else False
+    new_pass_count = prev_pass_count + (1 if in_lane else 0)
+
+    with data_lock:
+        shared_data['golden_lane_passed']     = in_lane
+        shared_data['golden_lane_pass_count'] = new_pass_count
+        shared_data['golden_lane_active']     = False
+        shared_data['golden_lane_number']     = -1
+        shared_data['event_active']           = None
+
+    if in_lane:
+        print(f"[GOLDEN LANE] PASSED! Car was in lane {gl_lane + 1}. "
+              f"Total passes: {new_pass_count}.")
+    else:
+        print(f"[GOLDEN LANE] MISSED. Car was in lane {int(estimated_lane) + 1}, "
+              f"needed lane {gl_lane + 1}.")
+
+    # Tactical win check
+    with data_lock:
+        net    = shared_data['tactical_net_green']
+        already_won = shared_data['tactical_win']
+    if not already_won and net >= TACTICAL_NET_GREEN_TARGET and new_pass_count >= 1:
+        with data_lock:
+            shared_data['tactical_win'] = True
+        print(f"[TACTICAL] WIN condition met! "
+              f"Net green = {net} (>= {TACTICAL_NET_GREEN_TARGET}), "
+              f"passes = {new_pass_count}.")
+
+
+# ---------------------------------------------------------
 # Decision Task (HIGH priority, 5 ms) — the priority state machine.
 # ---------------------------------------------------------
 def decision_task():
@@ -275,6 +380,8 @@ def decision_task():
         lane_from      = shared_data.get('lane_from', estimated_lane)
         lane_to        = shared_data.get('lane_to', target_lane)
         lane_change_start = shared_data.get('lane_change_start', 0.0)
+        golden_lane_active = shared_data.get('golden_lane_active', False)
+        golden_lane_number = shared_data.get('golden_lane_number', -1)
 
     now   = time.time()
     mid_x = car_center_x(frame_w)        # our car sits at the road centre
@@ -299,6 +406,9 @@ def decision_task():
         state = DriveState.CHASING_EVASION
     elif police_active:
         state = DriveState.POLICE
+    elif golden_lane_active and 0 <= golden_lane_number < NUM_LANES:
+        # Golden Lane: priority below Police but above normal coin avoidance
+        state = DriveState.GOLDEN_LANE
     else:
         danger_in_lane = any(
             t['lane'] == current_lane
@@ -348,7 +458,8 @@ def decision_task():
 
     # Pure-pursuit steering toward the chosen lane at the lookahead row.
     aggressive = full_commit or state in (DriveState.CHASING_EVASION,
-                                          DriveState.COIN_AVOID) or \
+                                          DriveState.COIN_AVOID,
+                                          DriveState.GOLDEN_LANE) or \
                  (state == DriveState.POLICE and police_urgent)
     gain = STEER_GAIN_AGGRO if aggressive else STEER_GAIN_NORMAL
 
