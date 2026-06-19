@@ -12,43 +12,156 @@ import time
 from config import (USE_YOLO, NUM_LANES, TOKEN_MIN_AREA, GRAY_MIN_AREA,
                     TOKEN_MIN_EXTENT, TOKEN_AR_LO, TOKEN_AR_HI,
                     CAR_MASK_TOP_FRAC, CAR_MASK_X0_FRAC, CAR_MASK_X1_FRAC,
-                    CHASING_MIN_AREA, CHASING_GRACE_S,
+                    CHASING_MIN_AREA, CHASING_GRACE_S, CHASING_SOLIDITY_MIN,
+                    CHASING_ROI_TOP_FRAC, CHASING_ROI_LEFT_FRAC, CHASING_ROI_RIGHT_FRAC,
                     POLICE_MIN_AREA, POLICE_ABSENT_GRACE,
                     YOLO_MODEL_PATH, YOLO_CONF)
 from core import shared_data, data_lock
-from lane_geometry import lane_of_x, road_polygon
+from lane_geometry import lane_of_x, road_polygon, road_bounds
 from low_light import detect_blanked_lanes
 
 
 # ---------------------------------------------------------
 # Challenge 2 — Chasing car (TEAL, back camera)
 # ---------------------------------------------------------
-def detect_chasing_car(frame):
-    """
-    The chasing car is TEAL (hue ~86-104) — distinct from the grass (plain green,
-    hue ~60). Require teal hue + SIZE + SOLIDITY in the CENTRAL ROAD band of the
-    back frame so grass on curves isn't mistaken for the car.
-    """
+def _chasing_roi_pixels(h, w):
+    return (int(h * CHASING_ROI_TOP_FRAC),
+            int(w * CHASING_ROI_LEFT_FRAC),
+            int(w * CHASING_ROI_RIGHT_FRAC))
+
+
+def build_chasing_teal_mask(frame):
+    """Teal HSV mask with chasing ROI margins zeroed — for debug overlay."""
+    if frame is None:
+        return None
     h, w = frame.shape[:2]
+    roi_top, roi_left, roi_right = _chasing_roi_pixels(h, w)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     teal_mask = cv2.inRange(hsv, np.array([86, 70, 70]), np.array([104, 255, 255]))
+    teal_mask[:roi_top, :] = 0
+    teal_mask[:, :roi_left] = 0
+    teal_mask[:, roi_right:] = 0
+    return teal_mask
 
-    teal_mask[:int(h * 0.25), :] = 0          # ignore sky/horizon
-    teal_mask[:, :int(w * 0.25)] = 0          # ignore left margin
-    teal_mask[:, int(w * 0.75):] = 0          # ignore right margin
+
+def _empty_chasing_debug(h=0, w=0):
+    roi_top, roi_left, roi_right = _chasing_roi_pixels(h, w) if h and w else (0, 0, 0)
+    return {
+        'detected': False,
+        'raw_detected': False,
+        'teal_area': 0.0,
+        'teal_solidity': 0.0,
+        'bbox': None,
+        'reject_reason': None,
+        'roi_top': roi_top,
+        'roi_left': roi_left,
+        'roi_right': roi_right,
+    }
+
+
+def detect_chasing_car_debug(frame):
+    """
+    Full chasing-car debug pass on the back frame.
+
+    Returns dict with detection result plus ROI, bbox, area, solidity, reject reason.
+    ``detected`` matches the original acceptance test (driving unchanged).
+    """
+    if frame is None:
+        return _empty_chasing_debug()
+
+    h, w = frame.shape[:2]
+    roi_top, roi_left, roi_right = _chasing_roi_pixels(h, w)
+    teal_mask = build_chasing_teal_mask(frame)
 
     contours, _ = cv2.findContours(teal_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return False
+        return _empty_chasing_debug(h, w)
 
     largest = max(contours, key=cv2.contourArea)
     area    = cv2.contourArea(largest)
-    if area < CHASING_MIN_AREA:
-        return False   # too small => a coin, not the car
-
     x, y, bw, bh = cv2.boundingRect(largest)
     solidity     = area / max(1, bw * bh)
-    return solidity > 0.40
+    dbg = {
+        'raw_detected': True,
+        'teal_area': float(area),
+        'teal_solidity': float(solidity),
+        'bbox': (x, y, bw, bh),
+        'detected': False,
+        'reject_reason': None,
+        'roi_top': roi_top,
+        'roi_left': roi_left,
+        'roi_right': roi_right,
+    }
+    if area < CHASING_MIN_AREA:
+        dbg['reject_reason'] = 'area'
+        return dbg
+    if solidity <= CHASING_SOLIDITY_MIN:
+        dbg['reject_reason'] = 'solidity'
+        return dbg
+    dbg['detected'] = True
+    return dbg
+
+
+def detect_chasing_car(frame):
+    """Backward-compatible wrapper — returns debug dict (``detected`` = pass/fail)."""
+    return detect_chasing_car_debug(frame)
+
+
+_chase_dbg_prev = {
+    'raw': False, 'detected': False, 'active': False,
+    'reject_reason': None, 'near_reject': None,
+}
+
+
+def _log_chase_debug_changes(chase_dbg, chasing_detected, chasing_active, appearance_count):
+    """Console logs only on chasing detection status changes."""
+    global _chase_dbg_prev
+    area = chase_dbg['teal_area']
+    sol = chase_dbg['teal_solidity']
+    reject_reason = chase_dbg.get('reject_reason')
+
+    if chasing_detected and not _chase_dbg_prev['detected']:
+        print(f"[CHASE DBG] Cyan car detected — area={area:.0f} sol={sol:.2f} "
+              f"bbox={chase_dbg['bbox']}")
+
+    if not chasing_detected and _chase_dbg_prev['detected']:
+        print("[CHASE DBG] Cyan car lost from back camera")
+
+    if chasing_active and not _chase_dbg_prev['active']:
+        print(f"[CHASING CAR] chasing_active=True (appearance #{appearance_count})")
+    elif not chasing_active and _chase_dbg_prev['active']:
+        print("[CHASE DBG] chasing_active=False")
+
+    if (reject_reason == 'area' and reject_reason != _chase_dbg_prev['reject_reason']
+            and chase_dbg['raw_detected'] and not chasing_detected):
+        print(f"[CHASE DBG] Teal rejected (area too small): area={area:.0f} < {CHASING_MIN_AREA}")
+
+    if (reject_reason == 'solidity' and reject_reason != _chase_dbg_prev['reject_reason']
+            and chase_dbg['raw_detected'] and not chasing_detected):
+        print(f"[CHASE DBG] Teal rejected (solidity): area={area:.0f} sol={sol:.2f} <= "
+              f"{CHASING_SOLIDITY_MIN:.2f}")
+
+    near_reject = None
+    if chase_dbg['raw_detected'] and not chasing_detected:
+        if area >= CHASING_MIN_AREA * 0.70 and area < CHASING_MIN_AREA:
+            near_reject = ('area', area, sol)
+        elif area >= CHASING_MIN_AREA and sol <= CHASING_SOLIDITY_MIN:
+            near_reject = ('solidity', area, sol)
+
+    if near_reject and near_reject != _chase_dbg_prev['near_reject']:
+        kind, a, s = near_reject
+        if kind == 'area':
+            print(f"[CHASE DBG] Near threshold — area={a:.0f} (min={CHASING_MIN_AREA})")
+        else:
+            print(f"[CHASE DBG] Near threshold — sol={s:.2f} (min={CHASING_SOLIDITY_MIN:.2f})")
+
+    _chase_dbg_prev = {
+        'raw': chase_dbg['raw_detected'],
+        'detected': chasing_detected,
+        'active': chasing_active,
+        'reject_reason': reject_reason if chase_dbg['raw_detected'] and not chasing_detected else None,
+        'near_reject': near_reject,
+    }
 
 
 # ---------------------------------------------------------
@@ -79,18 +192,108 @@ def detect_police_car(hsv, frame_h, frame_w):
 
 
 # ---------------------------------------------------------
-# Coins
+# Coins — trust / curb classification (front camera only)
 # ---------------------------------------------------------
-def _coin_shape_ok(c, area, min_area):
+_TOKEN_MAX_COIN_AREA   = 3200
+_TOKEN_CURB_STRIPE_AR  = 1.55
+_TOKEN_CURB_MAX_EXTENT = 0.42
+_TOKEN_WIDE_BBOX_FRAC  = 0.45
+_TOKEN_CONF_MIN        = 0.12
+_TOKEN_CONF_EDGE_START = 0.68
+_TOKEN_CONF_LARGE_AREA = 1600
+_FAR_TOKEN_Y_FRAC      = 0.55
+_TOKEN_MIN_AREA_FAR    = 12
+_FAR_TOKEN_CONF_FLOOR  = 0.72
+_CURB_EDGE_NEAR_FRAC   = 0.78
+_CURB_STRIPE_ELONG     = 1.38
+_CURB_LOW_EXTENT       = 0.40
+_CURB_COMPACT_ELONG    = 1.30
+_CURB_COMPACT_EXTENT   = 0.42
+_CURB_LIKE_CONF        = 0.15
+
+
+def _dynamic_min_area(cy, frame_h, base_min):
+    """Allow smaller blobs far away (higher on screen)."""
+    far_y = _FAR_TOKEN_Y_FRAC * frame_h
+    if cy >= far_y:
+        return base_min
+    t = cy / max(1.0, far_y)
+    return max(_TOKEN_MIN_AREA_FAR, int(base_min * (0.4 + 0.6 * t)))
+
+
+def _shape_metrics(cw, ch, area):
+    ar = cw / max(1, ch)
+    extent = area / max(1, cw * ch)
+    elong = max(ar, 1.0 / max(ar, 1e-3))
+    return ar, extent, elong
+
+
+def _is_compact_coin(elong, extent):
+    return elong < _CURB_COMPACT_ELONG and extent >= _CURB_COMPACT_EXTENT
+
+
+def _bad_shape(elong, extent, cw, road_w):
+    if elong >= _CURB_STRIPE_ELONG and extent < _CURB_LOW_EXTENT:
+        return True
+    if cw / max(1, road_w) > _TOKEN_WIDE_BBOX_FRAC and extent < _CURB_LOW_EXTENT:
+        return True
+    return False
+
+
+def _near_road_edge(tx, ty, frame_w, frame_h):
+    left, right = road_bounds(ty, frame_w, frame_h)
+    road_w = max(1, right - left)
+    frac = (tx - left) / road_w
+    edge_band = 1.0 - _CURB_EDGE_NEAR_FRAC
+    return frac <= edge_band or frac >= _CURB_EDGE_NEAR_FRAC
+
+
+def _is_curb_like(color, tx, ty, cw, ch, elong, extent, frame_w, frame_h):
+    """Red curb rumble: near road edge AND stripe-like — not compact edge coins."""
+    if color != 'red':
+        return False
+    if _is_compact_coin(elong, extent):
+        return False
+    left, right = road_bounds(ty, frame_w, frame_h)
+    road_w = max(1, right - left)
+    return _near_road_edge(tx, ty, frame_w, frame_h) and _bad_shape(elong, extent, cw, road_w)
+
+
+def _token_confidence(tx, ty, cw, ch, area, elong, extent, frame_w, frame_h, is_curb):
+    if is_curb:
+        return _CURB_LIKE_CONF
+    conf = 1.0
+    if _is_compact_coin(elong, extent):
+        conf = max(conf, 0.88)
+    if area > _TOKEN_CONF_LARGE_AREA:
+        conf *= max(0.5, 1.0 - (area - _TOKEN_CONF_LARGE_AREA) / 4000.0)
+    left, right = road_bounds(ty, frame_w, frame_h)
+    road_w = max(1, right - left)
+    frac = (tx - left) / road_w
+    edge_dist = min(frac, 1.0 - frac)
+    if _near_road_edge(tx, ty, frame_w, frame_h) and _bad_shape(elong, extent, cw, road_w):
+        conf *= max(_TOKEN_CONF_MIN, edge_dist / _TOKEN_CONF_EDGE_START)
+    if ty < _FAR_TOKEN_Y_FRAC * frame_h and _is_compact_coin(elong, extent):
+        conf = max(conf, _FAR_TOKEN_CONF_FLOOR)
+    return max(_TOKEN_CONF_MIN, min(1.0, conf))
+
+
+def _coin_shape_ok(c, area, min_area, frame_w, frame_h, ty, cw, ch):
     """Compact/round blob test — rejects HUD digits, lane dashes, edge stripes."""
     if area < min_area:
         return None
-    x, y, cw, ch = cv2.boundingRect(c)
-    ar     = cw / max(1, ch)
-    extent = area / max(1, cw * ch)
+    if area > _TOKEN_MAX_COIN_AREA:
+        return None
+    ar, extent, elong = _shape_metrics(cw, ch, area)
     if not (TOKEN_AR_LO < ar < TOKEN_AR_HI) or extent < TOKEN_MIN_EXTENT:
         return None
-    return x, y, cw, ch
+    left, right = road_bounds(ty, frame_w, frame_h)
+    road_w = max(1, right - left)
+    if elong >= _TOKEN_CURB_STRIPE_AR and extent < _TOKEN_CURB_MAX_EXTENT:
+        return None
+    if cw / road_w > _TOKEN_WIDE_BBOX_FRAC and extent < _TOKEN_CURB_MAX_EXTENT:
+        return None
+    return ar, extent, elong
 
 
 def classify_tokens(hsv, frame_h, frame_w, enable_gray=False):
@@ -119,14 +322,19 @@ def classify_tokens(hsv, frame_h, frame_w, enable_gray=False):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
             area = cv2.contourArea(c)
-            box  = _coin_shape_ok(c, area, min_area)
-            if box is None:
-                continue
-            x, y, cw, ch = box
+            x, y, cw, ch = cv2.boundingRect(c)
             tx, ty = x + cw // 2, y + ch // 2
+            dyn_min = _dynamic_min_area(ty, frame_h, min_area)
+            shape = _coin_shape_ok(c, area, dyn_min, frame_w, frame_h, ty, cw, ch)
+            if shape is None:
+                continue
+            ar, extent, elong = shape
+            is_curb = _is_curb_like(color_name, tx, ty, cw, ch, elong, extent, frame_w, frame_h)
+            conf = _token_confidence(tx, ty, cw, ch, area, elong, extent, frame_w, frame_h, is_curb)
             tokens.append({'color': color_name, 'x': tx, 'y': ty,
                            'w': cw, 'h': ch, 'area': area,
-                           'lane': lane_of_x(tx, ty, frame_w, frame_h)})
+                           'lane': lane_of_x(tx, ty, frame_w, frame_h),
+                           'confidence': conf, 'is_curb_like': is_curb})
 
     for color_name, mask in masks.items():
         collect(mask, color_name, TOKEN_MIN_AREA)
@@ -170,7 +378,9 @@ def detect_with_yolo(frame, back_frame, frame_h, frame_w):
         if cls in _YOLO_CLS_COLOR:
             tokens.append({'color': _YOLO_CLS_COLOR[cls], 'x': cx, 'y': cy,
                            'w': bw, 'h': bh, 'area': bw * bh,
-                           'lane': lane_of_x(cx, cy, frame_w, frame_h)})
+                           'lane': lane_of_x(cx, cy, frame_w, frame_h),
+                           'confidence': float(d.get('conf', 1.0)),
+                           'is_curb_like': False})
         elif cls == 3:
             if bw * bh > best_police_area:
                 best_police_area = bw * bh
@@ -211,11 +421,13 @@ def detection_task():
 
     if USE_YOLO:
         tokens, police_bbox, chasing_detected = detect_with_yolo(frame, back_frame, h, w)
+        chase_dbg = detect_chasing_car_debug(back_frame)
     else:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         tokens      = classify_tokens(hsv, h, w, enable_gray=any(blanked_lanes))
         police_bbox = detect_police_car(hsv, h, w)
-        chasing_detected = detect_chasing_car(back_frame) if back_frame is not None else False
+        chase_dbg = detect_chasing_car_debug(back_frame)
+        chasing_detected = chase_dbg['detected']
 
     now = time.time()
     with data_lock:
@@ -227,8 +439,6 @@ def detection_task():
         if not chasing_active:
             with data_lock:
                 shared_data['chasing_appearance_count'] += 1
-                count = shared_data['chasing_appearance_count']
-            print(f"[CHASING CAR] Appearance #{count} detected behind us! Evasive action!")
         with data_lock:
             shared_data['chasing_active']     = True
             shared_data['chasing_start_time'] = shared_data['chasing_start_time'] if chasing_active else now
@@ -238,11 +448,15 @@ def detection_task():
         with data_lock:
             chasing_last_seen = shared_data['chasing_last_seen']
         if chasing_active and (now - chasing_last_seen) > CHASING_GRACE_S:
-            print("[CHASING CAR] Evaded / gone. Returning to normal mode.")
             with data_lock:
                 shared_data['chasing_active'] = False
                 if shared_data.get('event_active') == 'chasing':
                     shared_data['event_active'] = None
+
+    with data_lock:
+        appearance_count = shared_data['chasing_appearance_count']
+        chasing_active = shared_data['chasing_active']
+    _log_chase_debug_changes(chase_dbg, chasing_detected, chasing_active, appearance_count)
 
     # --- Police state update ---
     if police_bbox is not None:
@@ -276,3 +490,11 @@ def detection_task():
         shared_data['blanked_lanes'] = blanked_lanes
         shared_data['frame_w']       = w
         shared_data['frame_h']       = h
+        shared_data['chasing_raw_detected']    = chase_dbg['raw_detected']
+        shared_data['chasing_detected']        = chase_dbg['detected']
+        shared_data['chasing_teal_area']       = chase_dbg['teal_area']
+        shared_data['chasing_teal_solidity']   = chase_dbg['teal_solidity']
+        shared_data['chasing_bbox']            = chase_dbg['bbox']
+        shared_data['chasing_mask_roi_top']    = chase_dbg['roi_top']
+        shared_data['chasing_mask_roi_left']   = chase_dbg['roi_left']
+        shared_data['chasing_mask_roi_right']  = chase_dbg['roi_right']

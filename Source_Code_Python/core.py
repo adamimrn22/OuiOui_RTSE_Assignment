@@ -70,6 +70,14 @@ shared_data = {
     'chasing_start_time':       0.0,
     'chasing_last_seen':        0.0,
     'chasing_appearance_count': 0,   # 1st appearance = 10s window, 2nd = 3s window
+    'chasing_raw_detected':     False,
+    'chasing_teal_area':        0.0,
+    'chasing_teal_solidity':    0.0,
+    'chasing_bbox':             None,
+    'chasing_detected':         False,
+    'chasing_mask_roi_top':     0,
+    'chasing_mask_roi_left':    0,
+    'chasing_mask_roi_right':   0,
 }
 data_lock = threading.Lock()
 is_running = True

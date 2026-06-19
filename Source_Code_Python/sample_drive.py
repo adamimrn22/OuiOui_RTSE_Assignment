@@ -24,7 +24,7 @@ from config import CENTER_LANE
 from low_light import brightness_task
 from token_detection import detection_task
 from steering import decision_task, send_controls_task, police_watchdog_task
-from visualization import draw_debug
+from visualization import draw_debug, draw_back_debug
 
 
 # ---------------------------------------------------------
@@ -81,7 +81,7 @@ if __name__ == '__main__':
                                                  dbg_state, dbg_target, dbg_tx, dbg_ly),
                                       (640, 480)))
             if back_frame is not None:
-                cv2.imshow("Back Camera", cv2.resize(back_frame, (640, 480)))
+                cv2.imshow("Back Camera", cv2.resize(draw_back_debug(back_frame), (640, 480)))
 
             if front_frame is not None or back_frame is not None:
                 cv2.waitKey(10)

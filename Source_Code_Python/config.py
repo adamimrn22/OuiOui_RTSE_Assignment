@@ -46,22 +46,30 @@ STEER_DEADZONE_FRAC = 0.02
 STEER_GAIN_NORMAL   = 0.20
 STEER_GAIN_AGGRO    = 0.10
 DEFAULT_LOOKAHEAD_FRAC = 0.60
-LANE_COMMIT_S       = 0.35
+LANE_COMMIT_S       = 0.45
+LANE_CHANGE_ESTIMATE_S = 0.55   # debug: time to interpolate estimated_lane during a switch
 
 # ---------------------------------------------------------
 # Lane scoring weights
 # ---------------------------------------------------------
 SCORE_CLEAR          =   60.0
 SCORE_LANE_CHANGE    =   38.0
-SCORE_GREEN_REWARD   =  170.0
+SCORE_GREEN_REWARD   =  420.0
 GREEN_WEIGHT_FLOOR   =   0.8
-SCORE_RED_PENALTY    =  220.0
-SCORE_YELLOW_PENALTY =  420.0
-SCORE_UNKNOWN_PENALTY=  140.0
+SCORE_RED_PENALTY    =  720.0
+SCORE_YELLOW_PENALTY =  220.0
+SCORE_UNKNOWN_PENALTY=  160.0
 SCORE_POLICE_BLOB    = 1000.0
 SCORE_BLANKED_LANE   =  130.0
 SCORE_RED_TARGET     =  260.0
-SWITCH_MARGIN        =   40.0
+SWITCH_MARGIN        =   70.0
+
+# Lane-first bonuses (applied after per-token scoring)
+GREEN_CLUSTER_BONUS       = 650.0
+GREEN_CLUSTER_COUNT_BONUS = 200.0   # per green beyond the 2nd in a lane
+RED_UNSAFE_PENALTY        = 1400.0
+YELLOW_SOFT_PENALTY       = 120.0
+RED_UNSAFE_Y_FRAC         = 0.55
 
 # ---------------------------------------------------------
 # Token (coin) detection
@@ -76,9 +84,13 @@ LOW_BRIGHTNESS_THRESHOLD = 25
 BLANK_LANE_THRESHOLD     = 12
 
 # Challenge 2 — Chasing Car (TEAL/CYAN car in the back camera)
-CHASING_MIN_AREA   = 1500
-CHASING_GRACE_S    = 1.0
-CHASING_2ND_WINDOW = 3.0
+CHASING_MIN_AREA        = 1500
+CHASING_GRACE_S         = 1.0
+CHASING_2ND_WINDOW      = 3.0
+CHASING_ROI_TOP_FRAC    = 0.25   # ignore top 25% of back frame
+CHASING_ROI_LEFT_FRAC   = 0.25   # ignore left 25%
+CHASING_ROI_RIGHT_FRAC  = 0.75   # active ROI ends here (ignore right 25%)
+CHASING_SOLIDITY_MIN    = 0.40
 
 # Challenge 3 — Police Car (collect a RED token before the deadline)
 POLICE_DEADLINE          = 10.0

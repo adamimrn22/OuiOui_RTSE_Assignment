@@ -16,7 +16,9 @@ from config import (NUM_LANES, CENTER_LANE,
                     SCORE_CLEAR, SCORE_LANE_CHANGE, SCORE_GREEN_REWARD,
                     GREEN_WEIGHT_FLOOR, SCORE_RED_PENALTY, SCORE_YELLOW_PENALTY,
                     SCORE_UNKNOWN_PENALTY, SCORE_POLICE_BLOB, SCORE_BLANKED_LANE,
-                    SCORE_RED_TARGET, SWITCH_MARGIN,
+                    SCORE_RED_TARGET, SWITCH_MARGIN, LANE_CHANGE_ESTIMATE_S,
+                    GREEN_CLUSTER_BONUS, GREEN_CLUSTER_COUNT_BONUS,
+                    RED_UNSAFE_PENALTY, YELLOW_SOFT_PENALTY, RED_UNSAFE_Y_FRAC,
                     POLICE_DEADLINE, POLICE_URGENT_THRESHOLD)
 import core
 from core import shared_data, data_lock, DriveState
@@ -26,10 +28,66 @@ from lane_geometry import lane_of_x, lane_center_at_row, car_center_x, proximity
 # ---------------------------------------------------------
 # Lane scoring core
 # ---------------------------------------------------------
+def _empty_lane_summary():
+    n = NUM_LANES
+    return {
+        'green_count':     [0] * n,
+        'red_count':       [0] * n,
+        'yellow_count':    [0] * n,
+        'nearest_red_y':   [0] * n,
+        'nearest_green_y': [0] * n,
+    }
+
+
+def build_lane_summary(tokens, frame_w, frame_h):
+    """Per-lane token counts and nearest y for cluster / unsafe logic."""
+    summary = _empty_lane_summary()
+    for t in tokens:
+        lane = t.get('lane', lane_of_x(t['x'], t['y'], frame_w, frame_h))
+        if not (0 <= lane < NUM_LANES):
+            continue
+        color = t['color']
+        ty = t['y']
+        if color == 'green':
+            summary['green_count'][lane] += 1
+            summary['nearest_green_y'][lane] = max(summary['nearest_green_y'][lane], ty)
+        elif color == 'red' and not t.get('is_curb_like', False):
+            summary['red_count'][lane] += 1
+            summary['nearest_red_y'][lane] = max(summary['nearest_red_y'][lane], ty)
+        elif color == 'yellow':
+            summary['yellow_count'][lane] += 1
+    return summary
+
+
+def _apply_lane_summary_bonuses(scores, summary, frame_h):
+    """Green cluster pull, near-red block, soft yellow — after token scoring."""
+    near_red_y = RED_UNSAFE_Y_FRAC * frame_h
+    for i in range(NUM_LANES):
+        gc = summary['green_count'][i]
+        rc = summary['red_count'][i]
+        yc = summary['yellow_count'][i]
+
+        if rc > 0 and summary['nearest_red_y'][i] > near_red_y:
+            scores[i] -= RED_UNSAFE_PENALTY
+
+        if gc >= 2 and rc == 0:
+            bonus = GREEN_CLUSTER_BONUS + GREEN_CLUSTER_COUNT_BONUS * max(0, gc - 2)
+            if yc > 0:
+                bonus *= max(0.70, 1.0 - 0.12 * yc)
+            scores[i] += bonus
+
+        if yc > 0 and rc == 0:
+            if gc >= 2:
+                scores[i] -= YELLOW_SOFT_PENALTY * 0.35 * yc
+            else:
+                scores[i] -= YELLOW_SOFT_PENALTY * min(1.0, yc)
+
+
 def score_lanes(tokens, police_bbox, blanked_lanes, current_lane,
                 state, police_urgent, frame_w, frame_h):
     """Assign every lane a score; the caller picks the highest (with hysteresis)."""
     scores = [SCORE_CLEAR] * NUM_LANES
+    summary = build_lane_summary(tokens, frame_w, frame_h)
 
     for i in range(NUM_LANES):
         scores[i] -= SCORE_LANE_CHANGE * abs(i - current_lane)
@@ -38,22 +96,27 @@ def score_lanes(tokens, police_bbox, blanked_lanes, current_lane,
 
     for t in tokens:
         lane = t.get('lane', lane_of_x(t['x'], t['y'], frame_w, frame_h))
+        if not (0 <= lane < NUM_LANES):
+            continue
         w    = proximity_weight(t, frame_h)
         color = t['color']
 
         if color == 'green':
-            # Keep a weight FLOOR so far green still pulls us toward its lane early.
             if not (state == DriveState.POLICE and police_urgent):
                 scores[lane] += SCORE_GREEN_REWARD * max(GREEN_WEIGHT_FLOOR, w)
         elif color == 'red':
+            if t.get('is_curb_like', False):
+                continue
             if red_is_target:
                 scores[lane] += SCORE_RED_TARGET * w
             else:
                 scores[lane] -= SCORE_RED_PENALTY * w
         elif color == 'yellow':
             scores[lane] -= SCORE_YELLOW_PENALTY * w
-        else:  # 'unknown'
+        else:
             scores[lane] -= SCORE_UNKNOWN_PENALTY * w
+
+    _apply_lane_summary_bonuses(scores, summary, frame_h)
 
     if police_bbox is not None:
         px, py, pw, ph = police_bbox
@@ -61,13 +124,14 @@ def score_lanes(tokens, police_bbox, blanked_lanes, current_lane,
         left_lane  = lane_of_x(px, ry, frame_w, frame_h)
         right_lane = lane_of_x(px + pw, ry, frame_w, frame_h)
         for i in range(min(left_lane, right_lane), max(left_lane, right_lane) + 1):
-            scores[i] -= SCORE_POLICE_BLOB
+            if 0 <= i < NUM_LANES:
+                scores[i] -= SCORE_POLICE_BLOB
 
     for i in range(NUM_LANES):
         if i < len(blanked_lanes) and blanked_lanes[i]:
             scores[i] -= SCORE_BLANKED_LANE
 
-    return scores
+    return scores, summary
 
 
 def choose_target_lane(scores, current_target):
@@ -80,12 +144,81 @@ def choose_target_lane(scores, current_target):
     return current_target
 
 
+def _lane_has_near_red(summary, lane, frame_h):
+    """True when lane has a non-curb red token below the unsafe y threshold."""
+    if not (0 <= lane < NUM_LANES):
+        return False
+    near_red_y = RED_UNSAFE_Y_FRAC * frame_h
+    return (summary['red_count'][lane] > 0
+            and summary['nearest_red_y'][lane] > near_red_y)
+
+
+def _best_lane_without_near_red(scores, summary, frame_h):
+    """Highest-scoring lane with no near red; fall back to global best if none."""
+    safe = [i for i in range(NUM_LANES) if not _lane_has_near_red(summary, i, frame_h)]
+    if not safe:
+        return int(np.argmax(scores))
+    return max(safe, key=lambda i: scores[i])
+
+
+def _choose_chase_escape_lane(scores, summary, frame_h, from_lane):
+    """Escape lane away from current position; prefer lanes without near red."""
+    from_lane = _clamp_lane(from_lane)
+    away = [i for i in range(NUM_LANES) if i != from_lane]
+    if not away:
+        away = list(range(NUM_LANES))
+    safe_away = [i for i in away if not _lane_has_near_red(summary, i, frame_h)]
+    pool = safe_away if safe_away else away
+    if not pool:
+        return int(np.argmax(scores))
+    return max(pool, key=lambda i: (scores[i], abs(i - from_lane)))
+
+
 def steer_toward(target_x, mid_x, frame_w, gain):
     """Proportional pure-pursuit steering toward target_x, with a centre dead-zone."""
     offset = target_x - mid_x
     if abs(offset) < frame_w * STEER_DEADZONE_FRAC:
         return 0.0
     return float(max(-1.0, min(1.0, offset / (frame_w * gain))))
+
+
+def _clamp_lane(lane):
+    return max(0, min(NUM_LANES - 1, int(lane)))
+
+
+def _update_lane_estimate(now, target_lane, new_target,
+                          estimated_lane, lane_from, lane_to, lane_change_start):
+    """Debug-only interpolation of which physical lane the car thinks it occupies."""
+    if not (0 <= estimated_lane < NUM_LANES):
+        estimated_lane = target_lane if 0 <= target_lane < NUM_LANES else CENTER_LANE
+    if not (0 <= lane_from < NUM_LANES):
+        lane_from = estimated_lane
+    if not (0 <= lane_to < NUM_LANES):
+        lane_to = new_target if 0 <= new_target < NUM_LANES else CENTER_LANE
+
+    if new_target != target_lane:
+        lane_from = estimated_lane
+        lane_to = new_target
+        lane_change_start = now
+
+    if lane_from == lane_to:
+        progress = 1.0
+        estimated_lane_float = float(lane_to)
+        estimated_lane = lane_to
+    else:
+        progress = (now - lane_change_start) / max(LANE_CHANGE_ESTIMATE_S, 1e-3)
+        progress = max(0.0, min(1.0, progress))
+        if progress >= 1.0:
+            estimated_lane = lane_to
+            estimated_lane_float = float(lane_to)
+            lane_from = lane_to
+        else:
+            estimated_lane_float = lane_from + (lane_to - lane_from) * progress
+            estimated_lane = _clamp_lane(round(estimated_lane_float))
+
+    lane_change_active = progress < 1.0 and lane_from != lane_to
+    return (estimated_lane, estimated_lane_float, lane_from, lane_to,
+            lane_change_start, progress, lane_change_active)
 
 
 # ---------------------------------------------------------
@@ -138,6 +271,10 @@ def decision_task():
         frame_h        = shared_data.get('frame_h', 480)
         target_lane    = shared_data.get('target_lane', CENTER_LANE)
         commit_until   = shared_data.get('commit_until', 0.0)
+        estimated_lane = shared_data.get('estimated_lane', target_lane)
+        lane_from      = shared_data.get('lane_from', estimated_lane)
+        lane_to        = shared_data.get('lane_to', target_lane)
+        lane_change_start = shared_data.get('lane_change_start', 0.0)
 
     now   = time.time()
     mid_x = car_center_x(frame_w)        # our car sits at the road centre
@@ -149,7 +286,13 @@ def decision_task():
             shared_data['acceleration_input'] = -1.0
         return
 
-    current_lane = CENTER_LANE
+    if 0 <= estimated_lane < NUM_LANES:
+        current_lane = estimated_lane
+    elif 0 <= target_lane < NUM_LANES:
+        current_lane = target_lane
+    else:
+        current_lane = CENTER_LANE
+    planning_lane = current_lane
 
     # Resolve the active state (highest priority wins).
     if chasing_active:
@@ -158,27 +301,50 @@ def decision_task():
         state = DriveState.POLICE
     else:
         danger_in_lane = any(
-            t['lane'] == current_lane and t['color'] in ('red', 'yellow', 'unknown')
+            t['lane'] == current_lane
+            and t['color'] in ('red', 'unknown')
+            and not t.get('is_curb_like', False)
             for t in tokens
         )
         state = DriveState.COIN_AVOID if danger_in_lane else DriveState.NORMAL
 
-    scores = score_lanes(tokens, police_bbox, blanked_lanes, current_lane,
-                         state, police_urgent, frame_w, frame_h)
+    scores, lane_summary = score_lanes(tokens, police_bbox, blanked_lanes, current_lane,
+                                      state, police_urgent, frame_w, frame_h)
 
     full_commit = False
+    chase_escape_reason = ''
     if state == DriveState.CHASING_EVASION:
         scores[current_lane] -= 500.0          # do not sit in the line of fire
         if chasing_count >= 2:                  # 2nd appearance: only ~3s to react
             full_commit = True
+        chase_escape_reason = 'second_chase' if chasing_count >= 2 else 'first_chase'
 
     # Choose a target lane (hysteresis + in-progress commit).
-    if now < commit_until and not full_commit:
-        new_target = target_lane
+    if state == DriveState.CHASING_EVASION:
+        # Chasing: break commit, steer to an escape lane away from planning lane.
+        escape_from = planning_lane
+        new_target = _choose_chase_escape_lane(scores, lane_summary, frame_h, escape_from)
+        commit_until = now + LANE_COMMIT_S
     else:
-        new_target = choose_target_lane(scores, target_lane)
-        if new_target != target_lane:
+        # Break commit immediately if the committed lane gains a near red (not during POLICE).
+        target_has_near_red = (
+            state != DriveState.POLICE
+            and _lane_has_near_red(lane_summary, target_lane, frame_h)
+        )
+        if target_has_near_red:
+            new_target = _best_lane_without_near_red(scores, lane_summary, frame_h)
             commit_until = now + LANE_COMMIT_S
+        elif now < commit_until and not full_commit:
+            new_target = target_lane
+        else:
+            new_target = choose_target_lane(scores, target_lane)
+            if new_target != target_lane:
+                commit_until = now + LANE_COMMIT_S
+
+    (estimated_lane, estimated_lane_float, lane_from, lane_to,
+     lane_change_start, lane_change_progress, lane_change_active) = _update_lane_estimate(
+        now, target_lane, new_target,
+        estimated_lane, lane_from, lane_to, lane_change_start)
 
     # Pure-pursuit steering toward the chosen lane at the lookahead row.
     aggressive = full_commit or state in (DriveState.CHASING_EVASION,
@@ -195,15 +361,39 @@ def decision_task():
     steer    = steer_toward(target_x, mid_x, frame_w, gain)
     accel    = 1.0                              # full throttle except low light
 
+    if chasing_active:
+        chase_reaction = {
+            'chasing_reaction_active': True,
+            'chasing_reaction_state': DriveState.CHASING_EVASION,
+            'chasing_escape_from_lane': current_lane,
+            'chasing_escape_target_lane': new_target,
+            'chasing_escape_full_commit': full_commit,
+            'chasing_escape_steer': steer,
+            'chasing_escape_reason': chase_escape_reason,
+        }
+    else:
+        chase_reaction = {'chasing_reaction_active': False}
+
     with data_lock:
-        shared_data['target_lane']        = new_target
-        shared_data['target_x']           = int(target_x)
-        shared_data['lookahead_y']        = int(lookahead_y)
-        shared_data['commit_until']       = commit_until
-        shared_data['lane_scores']        = scores
-        shared_data['state']              = state
-        shared_data['steering_input']     = steer
-        shared_data['acceleration_input'] = accel
+        shared_data['target_lane']            = new_target
+        shared_data['target_x']               = int(target_x)
+        shared_data['lookahead_y']            = int(lookahead_y)
+        shared_data['commit_until']           = commit_until
+        shared_data['lane_scores']            = scores
+        shared_data['lane_summary']           = lane_summary
+        shared_data['state']                  = state
+        shared_data['planning_lane']          = planning_lane
+        shared_data['estimated_lane']         = estimated_lane
+        shared_data['estimated_lane_float']   = estimated_lane_float
+        shared_data['lane_from']              = lane_from
+        shared_data['lane_to']                = lane_to
+        shared_data['lane_change_start']      = lane_change_start
+        shared_data['lane_change_progress']   = lane_change_progress
+        shared_data['lane_change_active']     = lane_change_active
+        shared_data['steering_input']         = steer
+        shared_data['acceleration_input']     = accel
+        for key, val in chase_reaction.items():
+            shared_data[key] = val
 
 
 # ---------------------------------------------------------
