@@ -439,9 +439,10 @@ def detect_golden_lane_hud(frame):
 # ---------------------------------------------------------
 def detection_task():
     with data_lock:
-        frame            = shared_data['latest_front_frame']
-        back_frame       = shared_data['latest_back_frame']
-        low_light_active = shared_data['low_light_active']
+        frame              = shared_data['latest_front_frame']
+        back_frame         = shared_data['latest_back_frame']
+        low_light_active   = shared_data['low_light_active']
+        detection_urgent   = shared_data.get('detection_urgent', False)
 
     if frame is None:
         return
@@ -461,11 +462,24 @@ def detection_task():
         tokens, police_bbox, chasing_detected = detect_with_yolo(frame, back_frame, h, w)
         chase_dbg = detect_chasing_car_debug(back_frame)
     else:
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        tokens      = classify_tokens(hsv, h, w, enable_gray=any(blanked_lanes))
-        police_bbox = detect_police_car(hsv, h, w)
-        chase_dbg = detect_chasing_car_debug(back_frame)
+        # AutoRS outer-loop analogue: when chasing/police urgent, always run
+        # back-camera detection but optionally reuse last token list to save CPU.
+        chase_dbg        = detect_chasing_car_debug(back_frame)
         chasing_detected = chase_dbg['detected']
+        if detection_urgent and not chasing_detected:
+            # Threat cleared — do full front-camera scan this cycle.
+            detection_urgent = False
+        with data_lock:
+            prev_tokens     = shared_data.get('tokens', [])
+            prev_police_bbox = shared_data.get('police_bbox', None)
+        if detection_urgent:
+            # Skip expensive HSV scan; reuse last known tokens.
+            tokens      = prev_tokens
+            police_bbox = prev_police_bbox
+        else:
+            hsv         = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            tokens      = classify_tokens(hsv, h, w, enable_gray=any(blanked_lanes))
+            police_bbox = detect_police_car(hsv, h, w)
 
     now = time.time()
     with data_lock:
@@ -481,13 +495,15 @@ def detection_task():
             shared_data['chasing_active']     = True
             shared_data['chasing_start_time'] = shared_data['chasing_start_time'] if chasing_active else now
             shared_data['chasing_last_seen']  = now
+            shared_data['chasing_teal_area']  = chase_dbg['teal_area']
             shared_data['event_active']       = 'chasing'
     else:
         with data_lock:
             chasing_last_seen = shared_data['chasing_last_seen']
         if chasing_active and (now - chasing_last_seen) > CHASING_GRACE_S:
             with data_lock:
-                shared_data['chasing_active'] = False
+                shared_data['chasing_active']    = False
+                shared_data['chasing_teal_area'] = 0.0
                 if shared_data.get('event_active') == 'chasing':
                     shared_data['event_active'] = None
 

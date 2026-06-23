@@ -180,7 +180,7 @@ def _choose_chase_escape_lane(scores, summary, frame_h, from_lane):
     pool = safe_away if safe_away else away
     if not pool:
         return int(np.argmax(scores))
-    return max(pool, key=lambda i: (scores[i], abs(i - from_lane)))
+    return max(pool, key=lambda i: (abs(i - from_lane), scores[i]))
 
 
 def steer_toward(target_x, mid_x, frame_w, gain):
@@ -370,8 +370,10 @@ def decision_task():
         police_active  = shared_data.get('police_active', False)
         police_urgent  = shared_data.get('police_urgent', False)
         police_bbox    = shared_data.get('police_bbox', None)
-        chasing_active = shared_data.get('chasing_active', False)
-        chasing_count  = shared_data.get('chasing_appearance_count', 0)
+        chasing_active    = shared_data.get('chasing_active', False)
+        chasing_count     = shared_data.get('chasing_appearance_count', 0)
+        chasing_teal_area = shared_data.get('chasing_teal_area', 0.0)
+        chasing_last_seen = shared_data.get('chasing_last_seen', 0.0)
         frame_w        = shared_data.get('frame_w', 640)
         frame_h        = shared_data.get('frame_h', 480)
         target_lane    = shared_data.get('target_lane', CENTER_LANE)
@@ -382,6 +384,7 @@ def decision_task():
         lane_change_start = shared_data.get('lane_change_start', 0.0)
         golden_lane_active = shared_data.get('golden_lane_active', False)
         golden_lane_number = shared_data.get('golden_lane_number', -1)
+        golden_lane_start  = shared_data.get('golden_lane_start', 0.0)
 
     now   = time.time()
     mid_x = car_center_x(frame_w)        # our car sits at the road centre
@@ -423,18 +426,65 @@ def decision_task():
 
     full_commit = False
     chase_escape_reason = ''
+    # AutoRS-inspired: as golden lane deadline approaches, amplify score boost
+    # (analogous to γ increasing when tracking error rises).
+    if state == DriveState.GOLDEN_LANE and 0 <= golden_lane_number < NUM_LANES:
+        elapsed_gl = now - golden_lane_start
+        remaining_gl = max(0.0, GOLDEN_LANE_DURATION - elapsed_gl)
+        # Scale from 1× at 5 s remaining to 4× at 0 s remaining.
+        pressure = 1.0 + 3.0 * max(0.0, (GOLDEN_LANE_DURATION - remaining_gl) / GOLDEN_LANE_DURATION)
+        scores[golden_lane_number] += GOLDEN_LANE_SCORE_BOOST * (pressure - 1.0)
+
+    # Post-evasion lane bias: keep mild pressure away from escape-from lane for 5s.
+    chase_cleared_s = now - chasing_last_seen
+    if not chasing_active and 0 < chase_cleared_s < 5.0:
+        prev_escape = shared_data.get('chasing_escape_from_lane', current_lane)
+        for i in range(NUM_LANES):
+            prox = max(0.0, 1.0 - abs(i - prev_escape) / max(1, NUM_LANES - 1))
+            scores[i] -= 150.0 * prox * (1.0 - chase_cleared_s / 5.0)
+
+    # Police car collision avoidance: penalise police car's lane heavily.
+    # Hitting the police car = GAME OVER, so avoid it unless we MUST collect red.
+    if police_active and police_bbox is not None and not police_urgent:
+        px, py, pw, ph = police_bbox
+        ry = py + ph
+        police_left  = lane_of_x(px,      ry, frame_w, frame_h)
+        police_right = lane_of_x(px + pw, ry, frame_w, frame_h)
+        for i in range(max(0, police_left - 1), min(NUM_LANES, police_right + 2)):
+            scores[i] -= 2000.0  # heavy penalty — do not enter police car's lane
+
     if state == DriveState.CHASING_EVASION:
-        scores[current_lane] -= 500.0          # do not sit in the line of fire
-        if chasing_count >= 2:                  # 2nd appearance: only ~3s to react
-            full_commit = True
+        # Proximity-based penalty — scale by blob area (bigger blob = harder push).
+        area_scale = max(1.0, min(2.0, chasing_teal_area / 1500.0))
+        for i in range(NUM_LANES):
+            proximity = max(0.0, 1.0 - abs(i - current_lane) / max(1, NUM_LANES - 1))
+            scores[i] -= 600.0 * proximity * area_scale
+        # Cap all scores at 0 — green bonuses must never override escape.
+        for i in range(NUM_LANES):
+            scores[i] = min(scores[i], 0.0)
+        full_commit = True   # commit on ALL appearances, not just 2nd
         chase_escape_reason = 'second_chase' if chasing_count >= 2 else 'first_chase'
+
+    # Golden Lane hard commit: in the final 1.5 s of the window the car MUST be
+    # in the golden lane when the timer expires — override all other lane choices.
+    golden_hard_commit = False
+    if state == DriveState.GOLDEN_LANE and 0 <= golden_lane_number < NUM_LANES:
+        elapsed_gl   = now - golden_lane_start
+        remaining_gl = max(0.0, GOLDEN_LANE_DURATION - elapsed_gl)
+        if remaining_gl < 1.5:
+            golden_hard_commit = True
+            full_commit = True
 
     # Choose a target lane (hysteresis + in-progress commit).
     if state == DriveState.CHASING_EVASION:
         # Chasing: break commit, steer to an escape lane away from planning lane.
         escape_from = planning_lane
         new_target = _choose_chase_escape_lane(scores, lane_summary, frame_h, escape_from)
-        commit_until = now + LANE_COMMIT_S
+        commit_until = now + 3.0   # hold escape lane for 3s, not the normal LANE_COMMIT_S
+    elif golden_hard_commit:
+        # AutoRS analogue: tracking error high (deadline imminent) → lock control output.
+        new_target   = golden_lane_number
+        commit_until = now + 2.0
     else:
         # Break commit immediately if the committed lane gains a near red (not during POLICE).
         target_has_near_red = (
@@ -463,14 +513,14 @@ def decision_task():
                  (state == DriveState.POLICE and police_urgent)
     gain = STEER_GAIN_AGGRO if aggressive else STEER_GAIN_NORMAL
 
-    if tokens:
-        lookahead_y = max(t['y'] for t in tokens)
-    else:
-        lookahead_y = int(DEFAULT_LOOKAHEAD_FRAC * frame_h)
+    # Fixed lookahead — aiming at the nearest token causes late jerky steering.
+    lookahead_y = int(DEFAULT_LOOKAHEAD_FRAC * frame_h)
 
     target_x = lane_center_at_row(new_target, lookahead_y, frame_w, frame_h)
     steer    = steer_toward(target_x, mid_x, frame_w, gain)
     accel    = 1.0                              # full throttle except low light
+    if state == DriveState.CHASING_EVASION:
+        accel = 1.15                            # extra throttle to pull away from chasing car
 
     if chasing_active:
         chase_reaction = {
@@ -505,6 +555,9 @@ def decision_task():
         shared_data['acceleration_input']     = accel
         for key, val in chase_reaction.items():
             shared_data[key] = val
+        # AutoRS outer-loop analogue: flag that chasing is active so detection
+        # task can prioritise back-camera processing over front-camera tokens.
+        shared_data['detection_urgent'] = chasing_active or police_urgent
 
 
 # ---------------------------------------------------------

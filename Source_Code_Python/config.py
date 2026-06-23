@@ -84,12 +84,12 @@ LOW_BRIGHTNESS_THRESHOLD = 25
 BLANK_LANE_THRESHOLD     = 12
 
 # Challenge 2 — Chasing Car (TEAL/CYAN car in the back camera)
-CHASING_MIN_AREA        = 1500
+CHASING_MIN_AREA        = 700     # detect car earlier (more reaction time)
 CHASING_GRACE_S         = 1.0
 CHASING_2ND_WINDOW      = 3.0
 CHASING_ROI_TOP_FRAC    = 0.25   # ignore top 25% of back frame
-CHASING_ROI_LEFT_FRAC   = 0.25   # ignore left 25%
-CHASING_ROI_RIGHT_FRAC  = 0.75   # active ROI ends here (ignore right 25%)
+CHASING_ROI_LEFT_FRAC   = 0.15   # widened: car still visible on edge lanes
+CHASING_ROI_RIGHT_FRAC  = 0.85   # widened: car still visible on edge lanes
 CHASING_SOLIDITY_MIN    = 0.40
 
 # Challenge 3 — Police Car (collect a RED token before the deadline)
