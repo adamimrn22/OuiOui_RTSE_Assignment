@@ -7,7 +7,8 @@ map points to lanes and lanes to pixel positions, accounting for perspective.
 """
 import numpy as np
 from config import (NUM_LANES, CENTER_LANE, ROAD_HORIZON_FRAC, ROAD_CENTER_FRAC,
-                    ROAD_TOP_HALF_W, ROAD_BOT_LEFT, ROAD_BOT_RIGHT)
+                    ROAD_TOP_HALF_W, ROAD_BOT_LEFT, ROAD_BOT_RIGHT,
+                    ROAD_DETECT_PAD_FRAC)
 
 
 def road_bounds(y, frame_w, frame_h):
@@ -58,7 +59,9 @@ def road_polygon(frame_w, frame_h):
     horizon = int(ROAD_HORIZON_FRAC * frame_h)
     lt, rt = road_bounds(horizon, frame_w, frame_h)
     lb, rb = road_bounds(frame_h, frame_w, frame_h)
-    pad = int(0.02 * frame_w)   # small pad so edge-lane coins aren't clipped
+    # Pad the DETECTION trapezoid generously so coins in / just past the outer lanes
+    # are still classified (they clamp to L1/L5). This does not affect lane math.
+    pad = int(ROAD_DETECT_PAD_FRAC * frame_w)
     return np.array([[int(lt) - pad, horizon], [int(rt) + pad, horizon],
                      [int(rb) + pad, frame_h], [int(lb) - pad, frame_h]], np.int32)
 
