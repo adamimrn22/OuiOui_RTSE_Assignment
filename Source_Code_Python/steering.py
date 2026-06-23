@@ -556,30 +556,4 @@ def decision_task():
         for key, val in chase_reaction.items():
             shared_data[key] = val
         # AutoRS outer-loop analogue: flag that chasing is active so detection
-        # task can prioritise back-camera processing over front-camera tokens.
-        shared_data['detection_urgent'] = chasing_active or police_urgent
-
-
-# ---------------------------------------------------------
-# Send Controls Task — packs and sends the two floats to the game.
-# (control_conn lives in core and is reassigned to None on send failure.)
-# ---------------------------------------------------------
-def send_controls_task():
-    if core.control_conn is None:
-        return
-
-    with data_lock:
-        steering_input     = shared_data['steering_input']
-        acceleration_input = shared_data['acceleration_input']
-        low_light_active   = shared_data['low_light_active']
-
-    # In low light, decision_task set -1.0 and we must NOT override it.
-    if not low_light_active:
-        acceleration_input = 1.0
-
-    try:
-        data = struct.pack('ff', steering_input, acceleration_input)
-        core.control_conn.sendall(data)
-    except Exception as e:
-        print(f"Control send error: {e}")
-        core.control_conn = None
+        # task can prioritise back-camera processing over front-camera t
