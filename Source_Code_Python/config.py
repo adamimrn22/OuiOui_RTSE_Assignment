@@ -33,6 +33,7 @@ ROAD_CENTER_FRAC  = 0.47      # x of the road centre (vanishing point + our car)
 ROAD_TOP_HALF_W   = 0.05      # half road-width at the horizon (narrow)
 ROAD_BOT_LEFT     = 0.17      # asphalt left edge at the bottom (inside the rumble)
 ROAD_BOT_RIGHT    = 0.77      # asphalt right edge at the bottom (inside the rumble)
+ROAD_DETECT_PAD_FRAC = 0.05  # extra horizontal padding on detection trapezoid (fraction of frame width)
 
 # Our own (red) car sprite — blanked out of detection so it isn't read as a coin.
 CAR_MASK_TOP_FRAC = 0.78

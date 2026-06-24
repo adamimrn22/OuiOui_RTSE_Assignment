@@ -556,4 +556,28 @@ def decision_task():
         for key, val in chase_reaction.items():
             shared_data[key] = val
         # AutoRS outer-loop analogue: flag that chasing is active so detection
-        # task can prioritise back-camera processing over front-camera t
+        # task can prioritise back-camera processing over front-camera token scan.
+        shared_data['detection_urgent'] = chasing_active or police_urgent
+
+
+# ---------------------------------------------------------
+# SendControls task (2 ms — HIGHEST priority)
+# Reads steering/acceleration from shared_data and sends to the game.
+# Runs every 2 ms so the game always has a fresh control command.
+# ---------------------------------------------------------
+def send_controls_task():
+    """Send the latest steering + acceleration values to the Unity game."""
+    import core as _core
+    with data_lock:
+        steer = shared_data.get('steering_input',     0.0)
+        accel = shared_data.get('acceleration_input', 1.0)
+
+    conn = _core.control_conn
+    if conn is None:
+        return  # not yet connected; skip silently
+
+    try:
+        payload = struct.pack('ff', float(steer), float(accel))
+        conn.sendall(payload)
+    except (OSError, BrokenPipeError):
+        pass  # connection dropped; main loop will handle shutdown
